@@ -4,6 +4,11 @@ import torch.utils.data as data
 from torch.utils.data.sampler import Sampler
 import tqdm
 
+try:
+    PIL_RESAMPLE = Image.Resampling.LANCZOS
+except AttributeError:
+    PIL_RESAMPLE = Image.LANCZOS
+
 class SYSUData(data.Dataset):
     def __init__(self, data_dir, transform1=None,transform2 = None, colorIndex=None, thermalIndex=None):
         # Load training images (path) and labels
@@ -164,7 +169,7 @@ class TestData_Inf(data.Dataset):
         test_image = []
         for i in range(len(test_img_file)):
             img = Image.open(test_img_file[i])
-            img = img.resize((img_size[0], img_size[1]), Image.ANTIALIAS)
+            img = img.resize((img_size[0], img_size[1]), PIL_RESAMPLE)
             pix_array = np.array(img)
             test_image.append(pix_array)
         test_image = np.array(test_image)
@@ -185,7 +190,7 @@ class TestData_Vis(data.Dataset):
         test_image = []
         for i in range(len(test_img_file)):
             img = Image.open(test_img_file[i])
-            img = img.resize((img_size[0], img_size[1]), Image.ANTIALIAS)
+            img = img.resize((img_size[0], img_size[1]), PIL_RESAMPLE)
             pix_array = np.array(img)
             test_image.append(pix_array)
         test_image = np.array(test_image)
@@ -206,7 +211,7 @@ class TrainData(data.Dataset):
         train_image = []
         for i in range(len(train_img_file)):
             img = train_img_file[i]
-            img = img.resize((img_size[0], img_size[1]), Image.ANTIALIAS)
+            img = img.resize((img_size[0], img_size[1]), PIL_RESAMPLE)
             pix_array = np.array(img)
             train_image.append(pix_array)
         train_image = np.array(train_image)

@@ -4,12 +4,14 @@ cfg = CN()
 cfg.SEED = 0
 
 # dataset
-cfg.DATASETS = ['regdb','sysu', 'llcm', 'vcm']    # sysu or regdb
-cfg.DATA_PATH_RegDB = '/home/cuizhenyu/VI-LReID/Dataset/RegDB/'
-cfg.DATA_PATH_SYSU = '/home/cuizhenyu/VI-LReID/Dataset/SYSU-MM01/'
-cfg.DATA_PATH_LLCM = '/home/cuizhenyu/VI-LReID/Dataset/LLCM/'
-cfg.DATA_PATH_VCM = '/home/cuizhenyu/VI-LReID/Dataset/HITSZ-VCM/'
-cfg.PRETRAIN_PATH = 'jx_vit_base_p16_224-80ecf9dd.pth'
+# Current working setup uses the three confirmed datasets first.
+# VCM will be added back after the dataset is uploaded and preprocessed.
+cfg.DATASETS = ['regdb', 'sysu', 'llcm']
+cfg.DATA_PATH_RegDB = '/data/sheng_hao_xuan_2025/datasets/RegDB/'
+cfg.DATA_PATH_SYSU = '/data/sheng_hao_xuan_2025/datasets/SYSU-MM01/'
+cfg.DATA_PATH_LLCM = '/data/sheng_hao_xuan_2025/datasets/LLCM/'
+cfg.DATA_PATH_VCM = '/data/sheng_hao_xuan_2025/datasets/HITSZ-VCM/'
+cfg.PRETRAIN_PATH = '/data/sheng_hao_xuan_2025/pretrained/jx_vit_base_p16_224-80ecf9dd.pth'
 
 cfg.START_EPOCH = 1
 cfg.MAX_EPOCH = 50

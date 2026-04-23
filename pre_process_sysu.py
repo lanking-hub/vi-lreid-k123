@@ -3,6 +3,11 @@ import numpy as np
 from PIL import Image
 from config.config import cfg
 
+try:
+	PIL_RESAMPLE = Image.Resampling.LANCZOS
+except AttributeError:
+	PIL_RESAMPLE = Image.LANCZOS
+
 root = cfg.DATA_PATH_SYSU
 
 rgb_cameras = ['cam1','cam2','cam4','cam5']
@@ -53,7 +58,7 @@ def read_imgs(img_paths, img_w, img_h):
 	for img_path in img_paths:
 		# img
 		img = Image.open(img_path)
-		img = img.resize((img_w, img_h), Image.ANTIALIAS)
+		img = img.resize((img_w, img_h), PIL_RESAMPLE)
 		pix_array = np.array(img)
 		train_img.append(pix_array)
 

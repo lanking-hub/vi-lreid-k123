@@ -63,26 +63,39 @@ class build_vision_transformer(nn.Module):
         self.l2norm = Normalize(2)
 
 
-    def forward(self, x, mod, fkd=False):
-        features, prompt_out = self.base(x, mod)
+    def forward(self, x, mod, task_id=None, fkd=False):
+        features = self.base(x, mod, task_id)
         feat = self.bottleneck(features)
 
         if fkd:
-            return self.l2norm(feat), prompt_out
+            return self.l2norm(feat)
 
         if self.training:
             cls_score = self.classifier(feat)
 
-            return cls_score, features, prompt_out
+            return cls_score, features
 
         else:
             return self.l2norm(feat)
 
+    def add_task(self, task_id):
+        if hasattr(self.base, 'add_task'):
+            self.base.add_task(task_id)
+
     def load_param(self, trained_path):
         param_dict = torch.load(trained_path)
         for i in param_dict:
-            if self.state_dict()[i.replace('module.', '')].shape == param_dict[i].shape:
-                self.state_dict()[i.replace('module.', '')].copy_(param_dict[i])
+            target_key = i.replace('module.', '')
+            if target_key not in self.state_dict():
+                if '.attn.qkv.' in target_key:
+                    target_key = target_key.replace('.attn.qkv.', '.attn.qkv.base.')
+                elif '.attn.proj.' in target_key:
+                    target_key = target_key.replace('.attn.proj.', '.attn.proj.base.')
+            if target_key not in self.state_dict():
+                print(target_key, " Not Found, Skip!")
+                continue
+            if self.state_dict()[target_key].shape == param_dict[i].shape:
+                self.state_dict()[target_key].copy_(param_dict[i])
             else:
                 print (i, " Not Match, Skip!")
         print('Loading pretrained model from {}'.format(trained_path))
@@ -94,8 +107,17 @@ class build_vision_transformer(nn.Module):
         model_new_state_dict = copy.deepcopy(self.state_dict())
         
         for i in param_dict:
-            if self.state_dict()[i.replace('module.', '')].shape == param_dict[i].shape:
-                model_new_state_dict[i.replace('module.', '')] = (1 - alpha) * self.state_dict()[i.replace('module.', '')] + (alpha) * param_dict[i]
+            target_key = i.replace('module.', '')
+            if target_key not in self.state_dict():
+                if '.attn.qkv.' in target_key:
+                    target_key = target_key.replace('.attn.qkv.', '.attn.qkv.base.')
+                elif '.attn.proj.' in target_key:
+                    target_key = target_key.replace('.attn.proj.', '.attn.proj.base.')
+            if target_key not in self.state_dict():
+                print(target_key, " Not Found, Skip!")
+                continue
+            if self.state_dict()[target_key].shape == param_dict[i].shape:
+                model_new_state_dict[target_key] = (1 - alpha) * self.state_dict()[target_key] + (alpha) * param_dict[i]
             else:
                 print (i, " Not Match, Skip!")
         print ('Merging old model from {}'.format(trained_path))

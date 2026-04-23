@@ -1,3 +1,5 @@
+"""Debug-oriented copy of train.py for small-scale validation runs."""
+
 from dataloader import SYSUData, RegDBData, LLCMData, VCMData, TrainData, TestData_Vis, TestData_Inf, GenIdx, IdentitySampler
 from datamanager import process_gallery_sysu, process_query_sysu, process_test_regdb, process_query_llcm, process_gallery_llcm, process_query_vcm, process_gallery_vcm, process_train_regdb, process_train_sysu, process_train_llcm, process_train_vcm
 import numpy as np
@@ -29,7 +31,7 @@ import sys
 from utils import Logger
 
 
-parser = argparse.ArgumentParser(description="PMT Training")
+parser = argparse.ArgumentParser(description="PMT Training (Debug Copy)")
 parser.add_argument('--config_file', default='config/SYSU.yml',
                     help='path to config file', type=str)
 parser.add_argument('--trial', default=1,
@@ -53,8 +55,8 @@ parser.add_argument('--gpu', default='0',
 parser.add_argument("opts", help="Modify config options using the command-line",
                     default=None,nargs=argparse.REMAINDER)
 parser.add_argument("--logs-dir", help="Modify config options using the command-line",
-                    default='logs_test',type=str)
-parser.add_argument('--setting', type=int, default=6, choices=[1, 2, 3, 4, 5, 6], help="training order setting")
+                    default='logs_debug_3stage',type=str)
+parser.add_argument('--setting', type=int, default=6, choices=[1, 2, 3, 4, 5, 6, 7], help="training order setting")
 parser.add_argument('--ema_weight', type=float, default=0.7)
 
 parser.add_argument('--proto_weight', type=float, default=1.0)
@@ -62,6 +64,11 @@ parser.add_argument('--inter_weight', type=float, default=0.5)
 
 parser.add_argument('--new_weight', type=float, default=1.0)
 parser.add_argument('--cross_weight', type=float, default=0.5)
+parser.add_argument('--debug_batch_size', type=int, default=8, help='smaller batch size for quick validation')
+parser.add_argument('--debug_test_batch', type=int, default=32, help='smaller test batch for quick validation')
+parser.add_argument('--debug_num_workers', type=int, default=4, help='smaller worker count for quick validation')
+parser.add_argument('--debug_max_epoch', type=int, default=1, help='run only a few epochs in debug validation')
+parser.add_argument('--freeze_backbone', action='store_true', help='freeze pretrained ViT backbone weights and keep LoRA/task heads trainable')
 
 args = parser.parse_args()
 
@@ -73,6 +80,9 @@ log_name = 'log.txt'
 sys.stdout = Logger(osp.join(args.logs_dir, log_name))
 
 cfg.merge_from_list(args.opts)
+cfg.defrost()
+cfg.BATCH_SIZE = args.debug_batch_size
+cfg.MAX_EPOCH = args.debug_max_epoch
 cfg.freeze()
 print("==========\nArgs:{}\n==========".format(args))
 
@@ -85,6 +95,8 @@ if args.setting == 1:
     training_set = ['regdb', 'sysu', 'llcm', 'vcm']
 elif args.setting == 6:
     training_set = ['regdb', 'sysu', 'llcm']
+elif args.setting == 7:
+    training_set = ['regdb']
 else:
     raise ValueError("Unsupported setting {} in current script".format(args.setting))
 
@@ -95,6 +107,30 @@ def freeze_old_task_experts(model, current_task_id):
         if 'task_bank.experts.' in name:
             expert_id = name.split('task_bank.experts.')[1].split('.')[0]
             param.requires_grad = (expert_id == current_key)
+
+
+def freeze_backbone_except_lora(model):
+    lora_keywords = (
+        'lora_A',
+        'lora_B',
+        'shared',
+        'rgb',
+        'infrared',
+        'task_bank',
+        'gamma_k1',
+        'gamma_k2',
+        'gamma_k3',
+    )
+    frozen_params = 0
+    trainable_params = 0
+    for name, param in model.named_parameters():
+        if name.startswith('base.') and not any(keyword in name for keyword in lora_keywords):
+            param.requires_grad = False
+            frozen_params += param.numel()
+        elif param.requires_grad:
+            trainable_params += param.numel()
+    print('[!INFO] Freeze backbone enabled: frozen base params={}, remaining trainable params={}'.format(
+        frozen_params, trainable_params))
 
 for idx, dataset_name in enumerate(training_set):
     print ("[!INFO]: Start Training on:", dataset_name)
@@ -147,6 +183,8 @@ for idx, dataset_name in enumerate(training_set):
         old_model = None
 
     freeze_old_task_experts(model, idx)
+    if args.freeze_backbone:
+        freeze_backbone_except_lora(model)
 
     criterion_ID = nn.CrossEntropyLoss()
     criterion_Tri = TripletLoss(margin=cfg.MARGIN, feat_norm='no')
@@ -185,8 +223,8 @@ for idx, dataset_name in enumerate(training_set):
             queryset.test_label = processed_data.query_labels
             gallset.test_label = processed_data.gallery_labels
 
-        query_loaders.append(data.DataLoader(queryset, batch_size=args.test_batch, shuffle=False, num_workers=args.num_workers))
-        gall_loaders.append(data.DataLoader(gallset, batch_size=args.test_batch, shuffle=False, num_workers=args.num_workers))
+        query_loaders.append(data.DataLoader(queryset, batch_size=args.debug_test_batch, shuffle=False, num_workers=args.debug_num_workers))
+        gall_loaders.append(data.DataLoader(gallset, batch_size=args.debug_test_batch, shuffle=False, num_workers=args.debug_num_workers))
         query_labels.append(queryset.test_label)
         gall_labels.append(gallset.test_label)
         query_cams.append(query_cam if training_set[ii] == 'sysu' else None)
@@ -377,7 +415,7 @@ for idx, dataset_name in enumerate(training_set):
         # RGB-IR
         trainset_rgb.cIndex = sampler_rgb.index1
         trainset_rgb.tIndex = sampler_rgb.index2
-        trainloader = data.DataLoader(trainset_rgb, batch_size=cfg.BATCH_SIZE, sampler=sampler_rgb, num_workers=args.num_workers, drop_last=True, pin_memory=True)
+        trainloader = data.DataLoader(trainset_rgb, batch_size=cfg.BATCH_SIZE, sampler=sampler_rgb, num_workers=args.debug_num_workers, drop_last=True, pin_memory=True)
 
         model = train(epoch, idx, model, scheduler, optimizer, scaler)
 
@@ -386,7 +424,7 @@ for idx, dataset_name in enumerate(training_set):
                 model_path = os.path.join(args.logs_dir, args.resume)
                 model.merge_param(model_path, args.ema_weight)
                 print ('[!INFO] Merge old model ......')
-            torch.save(model.state_dict(), osp.join('./'+args.logs_dir+'/', training_set[idx]) + '.pth')
+            torch.save(model.state_dict(), osp.join(args.logs_dir, training_set[idx] + '.pth'))
 
             if dataset_name == 'regdb':
                 train_img, train_label, train_mod = process_train_regdb(data_path)
@@ -397,7 +435,7 @@ for idx, dataset_name in enumerate(training_set):
             elif dataset_name == 'vcm':
                 train_img, train_label, train_mod = process_train_vcm(data_path)
             trainset = TrainData(train_img, train_label, train_mod, transform=transform_test, img_size=(cfg.W, cfg.H))
-            train_loader = data.DataLoader(trainset, batch_size=128, shuffle=False, num_workers=8)
+            train_loader = data.DataLoader(trainset, batch_size=128, shuffle=False, num_workers=args.debug_num_workers)
             vis_features_mean, vis_labels_named, inf_features_mean, inf_labels_named = get_old_proto(train_loader, model, task_id=idx)
             proto_type={}
             proto_type={
@@ -406,7 +444,7 @@ for idx, dataset_name in enumerate(training_set):
                 'inf_features_mean': inf_features_mean,
                 'inf_labels_named': inf_labels_named
             }
-            torch.save(proto_type, osp.join('./'+args.logs_dir+'/', dataset_name) + '_proto.pth')
+            torch.save(proto_type, osp.join(args.logs_dir, dataset_name + '_proto.pth'))
 
             R1_list, mAP_list = [],[]
             head_str, results_str, copy_str = '|', '|', ''

@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from itertools import repeat
 import collections.abc as container_abcs
 import copy
+from model.lora_layers import LoRALinearWithBranches
 
 def _ntuple(n):
     def parse(x):
@@ -86,21 +87,53 @@ class Mlp(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        qkv_bias=False,
+        qk_scale=None,
+        attn_drop=0.,
+        proj_drop=0.,
+        use_k1=False,
+        use_k2=False,
+        use_k3=False,
+        lora_rank=4,
+        lora_alpha=8,
+        lora_dropout=0.0,
+    ):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
         # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
         self.scale = qk_scale or head_dim ** -0.5
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        base_qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        base_proj = nn.Linear(dim, dim)
+        self.qkv = LoRALinearWithBranches(
+            base_qkv,
+            use_k1=use_k1,
+            use_k2=use_k2,
+            use_k3=use_k3,
+            rank=lora_rank,
+            alpha=lora_alpha,
+            dropout=lora_dropout,
+        )
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
+        self.proj = LoRALinearWithBranches(
+            base_proj,
+            use_k1=use_k1,
+            use_k2=use_k2,
+            use_k3=use_k3,
+            rank=lora_rank,
+            alpha=lora_alpha,
+            dropout=lora_dropout,
+        )
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
+    def forward(self, x, mod=None, task_id=None):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x, mod=mod, task_id=task_id).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
@@ -108,26 +141,55 @@ class Attention(nn.Module):
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C) #[128, 211, 768]
-        x = self.proj(x)
+        x = self.proj(x, mod=mod, task_id=task_id)
         x = self.proj_drop(x)
         return x
 
 
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        mlp_ratio=4.,
+        qkv_bias=False,
+        qk_scale=None,
+        drop=0.,
+        attn_drop=0.,
+        drop_path=0.,
+        act_layer=nn.GELU,
+        norm_layer=nn.LayerNorm,
+        use_k1=False,
+        use_k2=False,
+        use_k3=False,
+        lora_rank=4,
+        lora_alpha=8,
+        lora_dropout=0.0,
+    ):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+            use_k1=use_k1,
+            use_k2=use_k2,
+            use_k3=use_k3,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+        )
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x)))
+    def forward(self, x, mod=None, task_id=None):
+        x = x + self.drop_path(self.attn(self.norm1(x), mod=mod, task_id=task_id))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
@@ -173,9 +235,27 @@ class PatchEmbed_overlap(nn.Module):
 
 
 class ViT(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, stride_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
-                 num_heads=12, mlp_ratio=4., qkv_bias=True, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer = nn.LayerNorm):
+    def __init__(
+        self,
+        img_size=224,
+        patch_size=16,
+        stride_size=16,
+        in_chans=3,
+        num_classes=1000,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4.,
+        qkv_bias=True,
+        qk_scale=None,
+        drop_rate=0.,
+        attn_drop_rate=0.,
+        drop_path_rate=0.,
+        norm_layer=nn.LayerNorm,
+        lora_rank=4,
+        lora_alpha=8,
+        lora_dropout=0.0,
+    ):
         super(ViT, self).__init__()
         self.num_classes = num_classes
 
@@ -191,11 +271,28 @@ class ViT(nn.Module):
         self.pos_drop = nn.Dropout(p=drop_rate)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
 
+        shallow_depth = depth // 3
+        middle_depth = (2 * depth) // 3
         self.blocks = nn.ModuleList([
             Block(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
-            for i in range(depth)])
+                dim=embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[i],
+                norm_layer=norm_layer,
+                use_k1=(shallow_depth <= i < middle_depth),
+                use_k2=(i < shallow_depth),
+                use_k3=(i >= middle_depth),
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+            )
+            for i in range(depth)
+        ])
 
         self.norm = norm_layer(embed_dim)
         
@@ -246,6 +343,8 @@ class ViT(nn.Module):
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
+            if getattr(m, "_skip_vit_init", False):
+                return
             trunc_normal_(m.weight, std=.02)
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
@@ -303,19 +402,8 @@ class ViT(nn.Module):
         x_merge = x_merge.reshape(B, C, H, W)
         return self.com_dropout(x_merge)
     
-    def forward_features(self, x, mod=None):
+    def forward_features(self, x, mod=None, task_id=None):
         B = x.shape[0]
-
-        x_prompt = torch.zeros_like(x)
-        inf_idx = (mod == 0)
-        if inf_idx.sum() > 0:
-            x_prompt[inf_idx==True] = x_prompt[inf_idx==True] + self.mod_prompts(x[inf_idx==True], mod='inf')
-        rgb_idx = (mod == 1)
-        if rgb_idx.sum() > 0:
-            x_prompt[rgb_idx==True] = x_prompt[rgb_idx==True] + self.mod_prompts(x[rgb_idx==True], mod='rgb')
-        x_prompt = x_prompt + self.com_prompts(x)
-
-        x = x + x_prompt
 
         x = self.patch_embed(x)
 
@@ -324,9 +412,13 @@ class ViT(nn.Module):
 
         x = x + self.pos_embed
 
-        if mod == None:
+        if mod is None:
             print ("Error!")
             exit(0)
+        if not torch.is_tensor(mod):
+            mod = torch.as_tensor(mod, device=x.device)
+        else:
+            mod = mod.to(x.device)
         sub = (mod == 0)
 
         x[sub==True] = x[sub==True] + self.mod_embed[0].expand(len(x[sub==True]), self.patch_embed.num_patches+1, -1)
@@ -338,15 +430,22 @@ class ViT(nn.Module):
             if idx < 0:
                 x[sub==True] = x[sub==True] + self.feat_embed[(idx - 1) * 2].expand(len(x[sub==True]), self.patch_embed.num_patches+1, -1)
                 x[sub==False] = x[sub==False] + self.feat_embed[(idx - 1) * 2 + 1].expand(len(x[sub==False]), self.patch_embed.num_patches+1, -1)
-            x = blk(x)
+            x = blk(x, mod=mod, task_id=task_id)
 
         x = self.norm(x)
 
-        return x[:, 0], x_prompt
+        return x[:, 0]
 
-    def forward(self,x,mod):
-        x, x_prompt = self.forward_features(x,mod)
-        return x, x_prompt
+    def forward(self, x, mod, task_id=None):
+        x = self.forward_features(x, mod, task_id)
+        return x
+
+    def add_task(self, task_id):
+        for blk in self.blocks:
+            if hasattr(blk.attn.qkv, 'add_task'):
+                blk.attn.qkv.add_task(task_id)
+            if hasattr(blk.attn.proj, 'add_task'):
+                blk.attn.proj.add_task(task_id)
 
     def load_param(self, model_path):
         param_dict = torch.load(model_path, map_location='cpu')
@@ -367,11 +466,21 @@ class ViT(nn.Module):
                     print('distill need to choose right cls token in the pth')
                     v = torch.cat([v[:, 0:1], v[:, 2:]], dim=1)
                 v = resize_pos_embed(v, self.pos_embed, self.patch_embed.num_y, self.patch_embed.num_x)
+            target_key = k
+            if target_key not in self.state_dict():
+                if '.attn.qkv.' in target_key:
+                    target_key = target_key.replace('.attn.qkv.', '.attn.qkv.base.')
+                elif '.attn.proj.' in target_key:
+                    target_key = target_key.replace('.attn.proj.', '.attn.proj.base.')
+            if target_key not in self.state_dict():
+                print('===========================SKIP==========================')
+                print('key {} not found in current state_dict'.format(target_key))
+                continue
             try:
-                self.state_dict()[k].copy_(v)
-            except:
+                self.state_dict()[target_key].copy_(v)
+            except Exception:
                 print('===========================ERROR=========================')
-                print('shape do not match in k :{}: param_dict{} vs self.state_dict(){}'.format(k, v.shape, self.state_dict()[k].shape))
+                print('shape do not match in k :{}: param_dict{} vs self.state_dict(){}'.format(target_key, v.shape, self.state_dict()[target_key].shape))
 
 
 def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):

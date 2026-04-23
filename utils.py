@@ -33,7 +33,7 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def get_old_proto(train_loader, model):
+def get_old_proto(train_loader, model, task_id=None):
     
     model.eval()
     
@@ -45,7 +45,7 @@ def get_old_proto(train_loader, model):
     with torch.no_grad():
         for inputs, labels, mods in train_loader:
             inputs = Variable(inputs.cuda())
-            feats = model(inputs, mods)
+            feats = model(inputs, mods, task_id=task_id)
 
             for feat, label, mod in zip(feats, labels, mods):
                 if mod == 1:
