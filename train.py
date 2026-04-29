@@ -179,7 +179,7 @@ for idx, dataset_name in enumerate(training_set):
             gallset = TestData_Inf(gall_img, gall_label, transform=transform_test, img_size=(cfg.W, cfg.H))
         elif training_set[ii] == 'vcm':
             data_path = cfg.DATA_PATH_VCM
-            processed_data = VCM()
+            processed_data = VCM(root=cfg.DATA_PATH_VCM)
             queryset = VideoDataset_test_Inf(processed_data.query,1,"video_test",transform_test,processed_data.query_cam)
             gallset = VideoDataset_test_Vis(processed_data.gallery,1,"video_test",transform_test,processed_data.gallary_cam)
             queryset.test_label = processed_data.query_labels

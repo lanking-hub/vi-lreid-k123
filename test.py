@@ -252,7 +252,7 @@ elif args.dataset == 'vcm':
             print('==> no checkpoint found at {}'.format(args.resume))
 
 
-    processed_data = VCM()
+    processed_data = VCM(root=cfg.DATA_PATH_VCM)
 
     gallset = VideoDataset_test_Vis(processed_data.gallery,1,"video_test",transform_test,processed_data.gallary_cam)
     queryset = VideoDataset_test_Inf(processed_data.query,1,"video_test",transform_test,processed_data.query_cam)

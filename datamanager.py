@@ -306,17 +306,15 @@ def process_train_vcm(data_path):
     return train_color_list + train_thermal_list, train_color_label_list + train_thermal_label_list, [1 for i in train_color_path] + [0 for i in train_thermal_path]
 
 class VCM(object):
-    # modify the data path here according to yours
-    root = '/home/cuizhenyu/VI-LReID/Dataset/HITSZ-VCM/'
-    # training data
-    train_name_path = osp.join(root,'info/train_name.txt')
-    track_train_info_path = osp.join(root,'info/track_train_info.txt')
-    # testing data
-    test_name_path = osp.join(root,'info/test_name.txt')
-    track_test_info_path = osp.join(root,'info/track_test_info.txt')
-    query_IDX_path = osp.join(root,'info/query_IDX.txt')
-
-    def __init__(self,min_seq_len=12):
+    def __init__(self, root=None, min_seq_len=12):
+        if root is None:
+            root = '/home/cuizhenyu/VI-LReID/Dataset/HITSZ-VCM/'
+        self.root = root
+        self.train_name_path = osp.join(self.root, 'info/train_name.txt')
+        self.track_train_info_path = osp.join(self.root, 'info/track_train_info.txt')
+        self.test_name_path = osp.join(self.root, 'info/test_name.txt')
+        self.track_test_info_path = osp.join(self.root, 'info/track_test_info.txt')
+        self.query_IDX_path = osp.join(self.root, 'info/query_IDX.txt')
         self._check_before_run()
 
         # prepare meta data

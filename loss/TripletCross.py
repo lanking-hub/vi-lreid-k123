@@ -36,8 +36,8 @@ def hard_example_mining(dist_mat, target1, target2):
 	  thus we can cope with all anchors in parallel.
 	"""
 	m, n = dist_mat.size()
-	target1 = torch.tensor(target1, device=dist_mat.device)
-	target2 = torch.tensor(target2, device=dist_mat.device)
+	target1 = torch.as_tensor(target1, device=dist_mat.device)
+	target2 = torch.as_tensor(target2, device=dist_mat.device)
 
 	target1 = target1.view(m, 1)
 	target2 = target2.view(1, n)

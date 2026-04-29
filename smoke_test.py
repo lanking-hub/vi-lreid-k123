@@ -23,6 +23,7 @@ import torch.nn as nn
 sys.path.insert(0, os.path.dirname(__file__))
 
 from model.make_model import build_vision_transformer
+from model.lora_layers import TaskLoRABank
 from model.vision_transformer import ViT
 
 
@@ -50,7 +51,7 @@ def parse_args():
         nargs="*",
         default=["all"],
         help=(
-            "subset of tests to run. choices: vit branches add_task wrapper "
+            "subset of tests to run. choices: vit branches add_task router wrapper "
             "fkd freeze all"
         ),
     )
@@ -164,9 +165,14 @@ def test_add_task(device):
     )
 
     # Nudge one deep expert so we can verify task routing really selects different paths.
+    # We switch to training mode here because K3 routing semantics are:
+    # - training: current expert + previous experts
+    # - eval: current expert + all non-current experts
+    # In eval mode, perturbing expert 1 can also affect task_id=0 through fusion.
     with torch.no_grad():
         blk8.attn.qkv.task_bank.experts["1"].lora_B.weight.fill_(1e-3)
 
+    model.train()
     with torch.no_grad():
         feat0_after = model(x, mod, task_id=0)
         feat1_after = model(x, mod, task_id=1)
@@ -177,8 +183,61 @@ def test_add_task(device):
     print("add_task and task-specific forward OK")
 
 
+def test_router_bank(device):
+    print_header("Test 4: K3 stats-based fusion routing")
+    bank = TaskLoRABank(in_features=4, out_features=4, rank=1, alpha=1, route_tau=1.0)
+    bank.add_task(0, device=device, dtype=torch.float32)
+    bank.add_task(1, device=device, dtype=torch.float32)
+    bank.add_task(2, device=device, dtype=torch.float32)
+    bank.train()
+
+    with torch.no_grad():
+        for expert in bank.experts.values():
+            expert.lora_A.weight.fill_(1.0)
+            expert.lora_B.weight.zero_()
+
+        bank.experts["0"].lora_B.weight.fill_(1.0)
+        bank.experts["1"].lora_B.weight.fill_(2.0)
+        bank.experts["2"].lora_A.weight.zero_()
+        bank.experts["2"].lora_B.weight.zero_()
+
+        bank.route_mu_0.copy_(torch.tensor([1.0, 0.0, 0.0, 0.0], device=device))
+        bank.route_mu_1.copy_(torch.tensor([0.0, 1.0, 0.0, 0.0], device=device))
+
+    state_dict = bank.state_dict()
+    assert "route_mu_0" in state_dict and "route_mu_1" in state_dict and "route_mu_2" in state_dict
+
+    x = torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]], device=device, requires_grad=True)
+    out = bank(x, task_id=2)
+    weights = bank.last_old_weights
+
+    assert weights is not None and weights.numel() == 2
+    assert weights[0] > weights[1], "Expected old task 0 to receive a larger fusion weight during training"
+    assert torch.allclose(weights.sum(), torch.tensor(1.0), atol=1e-6)
+
+    out.sum().backward()
+    assert x.grad is not None
+    assert torch.allclose(
+        x.grad, torch.zeros_like(x.grad), atol=1e-8
+    ), "Old expert branch should be gradient-isolated when current expert is zeroed"
+    assert torch.count_nonzero(bank.route_mu_2).item() > 0, "Current-task EMA route stats should update during training"
+
+    bank.eval()
+    with torch.no_grad():
+        bank.route_mu_2.copy_(torch.tensor([1.0, 0.0, 0.0, 0.0], device=device))
+        eval_x = torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]], device=device)
+        eval_out = bank(eval_x, task_id=0)
+
+    eval_weights = bank.last_old_weights
+    assert eval_weights is not None and eval_weights.numel() == 2
+    assert bank.last_old_keys == ["1", "2"], "Eval mode should fuse all non-current experts"
+    assert eval_weights[1] > eval_weights[0], "Expected future task 2 to receive a larger fusion weight during eval"
+    assert torch.count_nonzero(eval_out).item() > 0, "Eval fusion should include non-current experts"
+    print("K3 routing bank OK")
+
+
 def test_wrapper_forward_backward(device, batch_size, pretrain_path):
-    print_header("Test 4: build_vision_transformer forward + backward")
+    print_header("Test 5: build_vision_transformer forward + backward")
     cfg = FakeCfg()
     cfg.PRETRAIN_PATH = pretrain_path
 
@@ -210,7 +269,7 @@ def test_wrapper_forward_backward(device, batch_size, pretrain_path):
 
 
 def test_fkd_mode(device, batch_size, pretrain_path):
-    print_header("Test 5: fkd=True output")
+    print_header("Test 6: fkd=True output")
     cfg = FakeCfg()
     cfg.PRETRAIN_PATH = pretrain_path
 
@@ -234,7 +293,7 @@ def test_fkd_mode(device, batch_size, pretrain_path):
 
 
 def test_freeze_logic(pretrain_path):
-    print_header("Test 6: freeze_old_task_experts logic")
+    print_header("Test 7: freeze_old_task_experts logic")
     cfg = FakeCfg()
     cfg.PRETRAIN_PATH = pretrain_path
 
@@ -286,6 +345,8 @@ def main():
         test_lora_branches()
     if run_all or "add_task" in requested:
         test_add_task(device)
+    if run_all or "router" in requested:
+        test_router_bank(device)
     if run_all or "wrapper" in requested:
         test_wrapper_forward_backward(device, args.batch_size, args.pretrain_path)
     if run_all or "fkd" in requested:
