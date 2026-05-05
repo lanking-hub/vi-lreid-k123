@@ -96,8 +96,26 @@ parser.add_argument('--ddp_consistency_debug', action='store_true', help='reduce
 parser.add_argument('--freeze_backbone', action='store_true', help='freeze pretrained ViT backbone weights and keep LoRA/task heads trainable')
 parser.add_argument('--route_tau', type=float, default=1.0, help='softmax temperature for K3 old-expert routing')
 parser.add_argument('--train_k3_old_scale', type=float, default=1.0, help='scaling factor for fused old K3 experts during training')
+parser.add_argument('--train_k3_old_scale_start', type=float, default=None,
+                    help='optional starting scale for scheduled training-time old K3 expert fusion')
+parser.add_argument('--train_k3_old_scale_warmup_epochs', type=int, default=0,
+                    help='number of epochs used to ramp train_k3_old_scale_start to train_k3_old_scale')
+parser.add_argument('--train_k3_old_scale_schedule', type=str, default='constant',
+                    choices=['constant', 'linear', 'cosine'],
+                    help='schedule for training-time old K3 expert fusion scale')
 parser.add_argument('--eval_k3_old_scale', type=float, default=1.0, help='scaling factor for fused old K3 experts during evaluation')
+parser.add_argument('--eval_k3_fusion_mode', type=str, default='all_except_current',
+                    choices=['all_except_current', 'previous', 'current_only'],
+                    help='K3 expert fusion mode used by the model during evaluation/testing')
+parser.add_argument('--distill_k3_fusion_mode', type=str, default='all_except_current',
+                    choices=['all_except_current', 'previous', 'current_only'],
+                    help='K3 expert fusion mode used by the frozen old model during distillation')
+parser.add_argument('--compare_eval_k3_fusion_modes', type=str, default='',
+                    help='optional comma-separated extra eval K3 fusion modes to test at each stage end')
 parser.add_argument('--dist_backend', type=str, default='nccl', help='distributed backend for torchrun launches')
+parser.add_argument('--log_branch_stats', action='store_true', help='record K1/K2/K3 branch contribution statistics during training')
+parser.add_argument('--branch_log_interval', type=int, default=1, help='record branch statistics every N epochs')
+parser.add_argument('--branch_log_blocks', type=str, default='0,3,4,7,8,11', help='comma-separated ViT block ids for branch statistics')
 
 args = parser.parse_args()
 
@@ -245,9 +263,10 @@ def stage_done_path(stage_name):
     return osp.join(args.logs_dir, '{}_stage.done'.format(stage_name))
 
 
-def append_stage_results(stage_name, stage_idx, metrics):
+def append_stage_results(stage_name, stage_idx, metrics, eval_k3_fusion_mode=None):
     results_path = osp.join(args.logs_dir, 'results.jsonl')
     summary_path = osp.join(args.logs_dir, 'results_summary.tsv')
+    eval_mode = args.eval_k3_fusion_mode if eval_k3_fusion_mode is None else eval_k3_fusion_mode
     row = {
         'stage': stage_name,
         'stage_idx': int(stage_idx),
@@ -256,10 +275,15 @@ def append_stage_results(stage_name, stage_idx, metrics):
         'avg_R1': float(np.mean([item['R1'] for item in metrics])),
         'route_tau': float(args.route_tau),
         'train_k3_old_scale': float(args.train_k3_old_scale),
+        'train_k3_old_scale_start': None if args.train_k3_old_scale_start is None else float(args.train_k3_old_scale_start),
+        'train_k3_old_scale_warmup_epochs': int(args.train_k3_old_scale_warmup_epochs),
+        'train_k3_old_scale_schedule': args.train_k3_old_scale_schedule,
         'eval_k3_old_scale': float(args.eval_k3_old_scale),
         'debug_max_epoch': int(args.debug_max_epoch),
         'debug_batch_size': int(args.debug_batch_size),
         'world_size': int(world_size),
+        'eval_k3_fusion_mode': eval_mode,
+        'distill_k3_fusion_mode': args.distill_k3_fusion_mode,
     }
 
     with open(results_path, 'a', encoding='utf-8') as results_file:
@@ -268,10 +292,15 @@ def append_stage_results(stage_name, stage_idx, metrics):
     write_header = not osp.exists(summary_path)
     with open(summary_path, 'a', encoding='utf-8') as summary_file:
         if write_header:
-            summary_file.write('stage\tstage_idx\tdataset\tmAP\tR1\tavg_mAP\tavg_R1\troute_tau\ttrain_k3_old_scale\teval_k3_old_scale\tdebug_max_epoch\tdebug_batch_size\tworld_size\n')
+            summary_file.write(
+                'stage\tstage_idx\tdataset\tmAP\tR1\tavg_mAP\tavg_R1\troute_tau\t'
+                'train_k3_old_scale\ttrain_k3_old_scale_start\ttrain_k3_old_scale_warmup_epochs\t'
+                'train_k3_old_scale_schedule\teval_k3_old_scale\tdebug_max_epoch\tdebug_batch_size\t'
+                'world_size\teval_k3_fusion_mode\tdistill_k3_fusion_mode\n'
+            )
         for item in metrics:
             summary_file.write(
-                '{}\t{}\t{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format(
+                '{}\t{}\t{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format(
                     stage_name,
                     int(stage_idx),
                     item['dataset'],
@@ -281,10 +310,15 @@ def append_stage_results(stage_name, stage_idx, metrics):
                     row['avg_R1'] * 100.0,
                     args.route_tau,
                     args.train_k3_old_scale,
+                    '' if args.train_k3_old_scale_start is None else args.train_k3_old_scale_start,
+                    args.train_k3_old_scale_warmup_epochs,
+                    args.train_k3_old_scale_schedule,
                     args.eval_k3_old_scale,
                     args.debug_max_epoch,
                     args.debug_batch_size,
                     world_size,
+                    eval_mode,
+                    args.distill_k3_fusion_mode,
                 )
             )
 
@@ -301,6 +335,33 @@ def get_debug_num_workers():
     if args.ddp_consistency_debug:
         return 0
     return args.debug_num_workers
+
+
+def parse_branch_log_blocks(value):
+    if value is None or str(value).strip() == '':
+        return []
+    block_ids = []
+    for part in str(value).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        block_ids.append(int(part))
+    return block_ids
+
+
+def parse_eval_k3_fusion_modes():
+    valid_modes = {'all_except_current', 'previous', 'current_only'}
+    modes = [args.eval_k3_fusion_mode]
+    if args.compare_eval_k3_fusion_modes:
+        for part in args.compare_eval_k3_fusion_modes.split(','):
+            mode = part.strip()
+            if not mode:
+                continue
+            if mode not in valid_modes:
+                raise ValueError('Unsupported eval K3 fusion mode: {}'.format(mode))
+            if mode not in modes:
+                modes.append(mode)
+    return modes
 
 
 def build_epoch_sampler_indices(trainset_rgb, color_pos_rgb, thermal_pos_rgb, stage_id, epoch):
@@ -372,7 +433,7 @@ def freeze_backbone_except_lora(model):
         frozen_params, trainable_params))
 
 
-def configure_k3_router(model, route_tau, train_old_scale, eval_old_scale):
+def configure_k3_router(model, route_tau, train_old_scale, eval_old_scale, eval_fusion_mode):
     bare_model = unwrap_model(model)
     configured = 0
     for module in bare_model.modules():
@@ -384,10 +445,60 @@ def configure_k3_router(model, route_tau, train_old_scale, eval_old_scale):
             task_bank.train_old_scale = float(train_old_scale)
         if hasattr(task_bank, 'eval_old_scale'):
             task_bank.eval_old_scale = float(eval_old_scale)
+        if hasattr(task_bank, 'eval_fusion_mode'):
+            task_bank.eval_fusion_mode = str(eval_fusion_mode)
         configured += 1
     if configured > 0:
-        print('[!INFO] Configure K3 router: banks={}, route_tau={}, train_k3_old_scale={}, eval_k3_old_scale={}'.format(
-            configured, route_tau, train_old_scale, eval_old_scale))
+        print('[!INFO] Configure K3 router: banks={}, route_tau={}, train_k3_old_scale={}, eval_k3_old_scale={}, eval_k3_fusion_mode={}'.format(
+            configured, route_tau, train_old_scale, eval_old_scale, eval_fusion_mode))
+
+
+def compute_train_k3_old_scale(epoch):
+    end_scale = float(args.train_k3_old_scale)
+    if args.train_k3_old_scale_schedule == 'constant':
+        return end_scale
+
+    start_scale = 0.0 if args.train_k3_old_scale_start is None else float(args.train_k3_old_scale_start)
+    warmup_epochs = int(args.train_k3_old_scale_warmup_epochs)
+    if warmup_epochs <= 0:
+        return end_scale
+    if warmup_epochs == 1:
+        progress = 1.0
+    else:
+        progress = float(epoch - cfg.START_EPOCH) / float(warmup_epochs - 1)
+        progress = min(max(progress, 0.0), 1.0)
+
+    if args.train_k3_old_scale_schedule == 'linear':
+        factor = progress
+    elif args.train_k3_old_scale_schedule == 'cosine':
+        factor = 0.5 - 0.5 * np.cos(np.pi * progress)
+    else:
+        raise ValueError('Unsupported train_k3_old_scale_schedule: {}'.format(args.train_k3_old_scale_schedule))
+    return start_scale + (end_scale - start_scale) * factor
+
+
+def set_k3_train_old_scale(model, train_old_scale):
+    bare_model = unwrap_model(model)
+    configured = 0
+    for module in bare_model.modules():
+        task_bank = getattr(module, 'task_bank', None)
+        if task_bank is None or not hasattr(task_bank, 'train_old_scale'):
+            continue
+        task_bank.train_old_scale = float(train_old_scale)
+        configured += 1
+    return configured
+
+
+def set_k3_eval_fusion_mode(model, eval_fusion_mode):
+    bare_model = unwrap_model(model)
+    configured = 0
+    for module in bare_model.modules():
+        task_bank = getattr(module, 'task_bank', None)
+        if task_bank is None or not hasattr(task_bank, 'eval_fusion_mode'):
+            continue
+        task_bank.eval_fusion_mode = str(eval_fusion_mode)
+        configured += 1
+    return configured
 
 
 def _fmt_router_values(value):
@@ -442,6 +553,245 @@ def log_k3_router_stats(model, phase, stage_name, epoch=None, eval_name=None):
             print('  ' + line)
     else:
         print(prefix + ' no_old_expert_fusion')
+
+
+class BranchStatsCollector:
+    def __init__(self, model, logs_dir, block_ids, device, distributed=False):
+        self.model = unwrap_model(model)
+        self.logs_dir = logs_dir
+        self.block_ids = set(int(block_id) for block_id in block_ids)
+        self.device = device
+        self.distributed = distributed
+        self.handles = []
+        self.records = {}
+        self.stat_scope = 'global_ddp_reduced' if distributed else 'single_process'
+        self._register_hooks()
+
+    def _parse_branch_module(self, name):
+        parts = name.split('.')
+        if len(parts) != 5:
+            return None
+        if parts[0] != 'base' or parts[1] != 'blocks' or parts[3] != 'attn':
+            return None
+        try:
+            block_id = int(parts[2])
+        except ValueError:
+            return None
+        branch_name = parts[4]
+        if block_id not in self.block_ids or branch_name not in ('qkv', 'proj'):
+            return None
+        return block_id, branch_name
+
+    def _register_hooks(self):
+        for name, module in self.model.named_modules():
+            parsed = self._parse_branch_module(name)
+            if parsed is None or not hasattr(module, 'enable_branch_stats'):
+                continue
+            module.enable_branch_stats = True
+            module.last_branch_stats = None
+            handle = module.register_forward_hook(self._make_hook(name))
+            self.handles.append((handle, module))
+
+    def _make_hook(self, module_name):
+        def hook(module, inputs, output):
+            branch_stats = getattr(module, 'last_branch_stats', None)
+            if not branch_stats:
+                return
+            for stat in branch_stats:
+                branch = stat.get('branch')
+                if branch is None:
+                    continue
+                key = (module_name, branch)
+                accumulator = self.records.setdefault(key, {})
+                self._accumulate(accumulator, stat)
+        return hook
+
+    def _accumulate(self, accumulator, stat):
+        stat_count = stat.get('count')
+        for key, value in stat.items():
+            if key == 'branch':
+                continue
+            if not torch.is_tensor(value):
+                continue
+            value = value.detach().to(device=self.device, dtype=torch.float64)
+            if key in ('gamma', 'gamma_rgb', 'gamma_ir') and torch.is_tensor(stat_count):
+                value = value * stat_count.detach().to(device=self.device, dtype=torch.float64)
+            if key not in accumulator:
+                accumulator[key] = torch.zeros((), device=self.device, dtype=torch.float64)
+            accumulator[key] = accumulator[key] + value
+
+    def _reduced_records(self):
+        reduced = {}
+        for record_key, accumulator in self.records.items():
+            reduced_accumulator = {}
+            for metric_name, value in accumulator.items():
+                tensor = value.detach().clone()
+                if self.distributed:
+                    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+                reduced_accumulator[metric_name] = tensor.item()
+            reduced[record_key] = reduced_accumulator
+        return reduced
+
+    def _safe_mean(self, values, count_name, sum_name):
+        count = values.get(count_name, 0.0)
+        if count <= 0 or sum_name not in values:
+            return None
+        return values.get(sum_name, 0.0) / count
+
+    def _safe_std(self, values, count_name, sum_name, sq_sum_name):
+        count = values.get(count_name, 0.0)
+        if count <= 0 or sum_name not in values or sq_sum_name not in values:
+            return None
+        mean = values.get(sum_name, 0.0) / count
+        mean_sq = values.get(sq_sum_name, 0.0) / count
+        return max(mean_sq - mean * mean, 0.0) ** 0.5
+
+    def _format_row(self, module_name, branch, values, stage_name, stage_idx, epoch):
+        count = values.get('count', 0.0)
+        if count <= 0:
+            return None
+
+        row = {
+            'stage': stage_name,
+            'stage_idx': int(stage_idx),
+            'epoch': int(epoch),
+            'phase': 'train',
+            'module': module_name,
+            'branch': branch,
+            'stat_scope': self.stat_scope,
+            'count': float(count),
+            'delta_norm_mean': self._safe_mean(values, 'count', 'delta_norm_sum'),
+            'delta_norm_std': self._safe_std(values, 'count', 'delta_norm_sum', 'delta_norm_sq_sum'),
+            'delta_abs_mean': self._safe_mean(values, 'count', 'delta_abs_sum'),
+            'scaled_delta_norm_mean': self._safe_mean(values, 'count', 'scaled_delta_norm_sum'),
+            'scaled_delta_norm_std': self._safe_std(values, 'count', 'scaled_delta_norm_sum', 'scaled_delta_norm_sq_sum'),
+            'rgb_scaled_delta_norm_mean': self._safe_mean(values, 'rgb_count', 'rgb_scaled_delta_norm_sum'),
+            'ir_scaled_delta_norm_mean': self._safe_mean(values, 'ir_count', 'ir_scaled_delta_norm_sum'),
+            'k3_current_scaled_norm_mean': self._safe_mean(values, 'count', 'k3_current_scaled_norm_sum'),
+            'k3_current_scaled_norm_std': self._safe_std(values, 'count', 'k3_current_scaled_norm_sum', 'k3_current_scaled_norm_sq_sum'),
+            'k3_old_scaled_norm_mean': self._safe_mean(values, 'count', 'k3_old_scaled_norm_sum'),
+            'k3_old_scaled_norm_std': self._safe_std(values, 'count', 'k3_old_scaled_norm_sum', 'k3_old_scaled_norm_sq_sum'),
+            'k3_old_current_ratio_mean': self._safe_mean(values, 'count', 'k3_old_current_ratio_sum'),
+            'k3_old_fraction_mean': self._safe_mean(values, 'count', 'k3_old_fraction_sum'),
+        }
+        rgb_norm = row['rgb_scaled_delta_norm_mean']
+        ir_norm = row['ir_scaled_delta_norm_mean']
+        if rgb_norm is not None and ir_norm is not None:
+            row['modality_gap'] = abs(rgb_norm - ir_norm) / (rgb_norm + ir_norm + 1e-12)
+        else:
+            row['modality_gap'] = None
+
+        if branch == 'k2':
+            gamma_rgb = self._safe_mean(values, 'count', 'gamma_rgb')
+            gamma_ir = self._safe_mean(values, 'count', 'gamma_ir')
+            row['gamma_rgb'] = gamma_rgb
+            row['gamma_ir'] = gamma_ir
+            row['selected_scaled_delta_norm_mean'] = row['scaled_delta_norm_mean']
+            row['gamma'] = None
+        else:
+            row['gamma'] = self._safe_mean(values, 'count', 'gamma')
+            row['gamma_rgb'] = None
+            row['gamma_ir'] = None
+            row['selected_scaled_delta_norm_mean'] = None
+        return row
+
+    def _router_rows(self, stage_name, stage_idx, epoch):
+        rows = []
+        for block_idx, blk in enumerate(getattr(self.model.base, 'blocks', [])):
+            if block_idx not in self.block_ids:
+                continue
+            for branch_name, branch in (('qkv', blk.attn.qkv), ('proj', blk.attn.proj)):
+                task_bank = getattr(branch, 'task_bank', None)
+                if task_bank is None:
+                    continue
+                snapshot = task_bank.get_route_debug_snapshot()
+                weights = snapshot.get('weights')
+                if weights is None or weights.numel() == 0:
+                    continue
+                rows.append({
+                    'stage': stage_name,
+                    'stage_idx': int(stage_idx),
+                    'epoch': int(epoch),
+                    'phase': 'train',
+                    'module': 'base.blocks.{}.attn.{}'.format(block_idx, branch_name),
+                    'branch': 'k3_router',
+                    'stat_scope': 'rank0_snapshot',
+                    'old_keys': snapshot.get('old_keys'),
+                    'max_weight': float(weights.max().item()),
+                    'entropy': None if snapshot.get('entropy') is None else float(snapshot['entropy'].item()),
+                    'tau': float(snapshot.get('tau')),
+                    'old_scale': float(snapshot.get('old_scale')),
+                    'weights': [float(value) for value in weights.tolist()],
+                    'similarities': None if snapshot.get('similarities') is None else [float(value) for value in snapshot['similarities'].tolist()],
+                })
+        return rows
+
+    def dump_epoch(self, stage_name, stage_idx, epoch):
+        if not self.records:
+            return
+        reduced_records = self._reduced_records()
+        rows = []
+        for (module_name, branch), values in sorted(reduced_records.items()):
+            row = self._format_row(module_name, branch, values, stage_name, stage_idx, epoch)
+            if row is not None:
+                rows.append(row)
+
+        if is_main_process():
+            jsonl_path = osp.join(self.logs_dir, 'branch_stats.jsonl')
+            summary_path = osp.join(self.logs_dir, 'branch_summary.tsv')
+            with open(jsonl_path, 'a', encoding='utf-8') as jsonl_file:
+                for row in rows:
+                    jsonl_file.write(json.dumps(row, sort_keys=True) + '\n')
+                for row in self._router_rows(stage_name, stage_idx, epoch):
+                    jsonl_file.write(json.dumps(row, sort_keys=True) + '\n')
+
+            write_header = not osp.exists(summary_path)
+            with open(summary_path, 'a', encoding='utf-8') as summary_file:
+                if write_header:
+                    summary_file.write(
+                        'stage\tstage_idx\tepoch\tmodule\tbranch\tstat_scope\tgamma\tgamma_rgb\tgamma_ir\t'
+                        'delta_norm\tdelta_norm_std\tscaled_delta_norm\tselected_scaled_delta_norm\t'
+                        'rgb_norm\tir_norm\tmodality_gap\tk3_current_norm\tk3_old_norm\t'
+                        'k3_old_current_ratio\tk3_old_fraction\tcount\n'
+                    )
+                for row in rows:
+                    summary_file.write(
+                        '{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format(
+                            row['stage'],
+                            row['stage_idx'],
+                            row['epoch'],
+                            row['module'],
+                            row['branch'],
+                            row['stat_scope'],
+                            '' if row['gamma'] is None else '{:.8f}'.format(row['gamma']),
+                            '' if row['gamma_rgb'] is None else '{:.8f}'.format(row['gamma_rgb']),
+                            '' if row['gamma_ir'] is None else '{:.8f}'.format(row['gamma_ir']),
+                            '' if row['delta_norm_mean'] is None else '{:.8f}'.format(row['delta_norm_mean']),
+                            '' if row['delta_norm_std'] is None else '{:.8f}'.format(row['delta_norm_std']),
+                            '' if row['scaled_delta_norm_mean'] is None else '{:.8f}'.format(row['scaled_delta_norm_mean']),
+                            '' if row['selected_scaled_delta_norm_mean'] is None else '{:.8f}'.format(row['selected_scaled_delta_norm_mean']),
+                            '' if row['rgb_scaled_delta_norm_mean'] is None else '{:.8f}'.format(row['rgb_scaled_delta_norm_mean']),
+                            '' if row['ir_scaled_delta_norm_mean'] is None else '{:.8f}'.format(row['ir_scaled_delta_norm_mean']),
+                            '' if row['modality_gap'] is None else '{:.8f}'.format(row['modality_gap']),
+                            '' if row['k3_current_scaled_norm_mean'] is None else '{:.8f}'.format(row['k3_current_scaled_norm_mean']),
+                            '' if row['k3_old_scaled_norm_mean'] is None else '{:.8f}'.format(row['k3_old_scaled_norm_mean']),
+                            '' if row['k3_old_current_ratio_mean'] is None else '{:.8f}'.format(row['k3_old_current_ratio_mean']),
+                            '' if row['k3_old_fraction_mean'] is None else '{:.8f}'.format(row['k3_old_fraction_mean']),
+                            '{:.0f}'.format(row['count']),
+                        )
+                    )
+        self.reset()
+
+    def reset(self):
+        self.records = {}
+
+    def close(self):
+        for handle, module in self.handles:
+            handle.remove()
+            module.enable_branch_stats = False
+            module.last_branch_stats = None
+        self.handles = []
+        self.records = {}
 
 
 def build_train_loader(trainset_rgb, color_pos_rgb, thermal_pos_rgb, stage_id, epoch):
@@ -711,7 +1061,7 @@ for idx, dataset_name in enumerate(training_set):
 
     base_model = build_vision_transformer(num_classes=num_classes, cfg=cfg)
     base_model.to(device)
-    configure_k3_router(base_model, args.route_tau, args.train_k3_old_scale, args.eval_k3_old_scale)
+    configure_k3_router(base_model, args.route_tau, args.train_k3_old_scale, args.eval_k3_old_scale, args.eval_k3_fusion_mode)
 
     if idx > 0:
         args.resume = training_set[idx - 1] + '.pth'
@@ -742,7 +1092,7 @@ for idx, dataset_name in enumerate(training_set):
 
         old_model = build_vision_transformer(num_classes=old_num_classes[0], cfg=cfg)
         old_model.to(device)
-        configure_k3_router(old_model, args.route_tau, args.train_k3_old_scale, args.eval_k3_old_scale)
+        configure_k3_router(old_model, args.route_tau, args.train_k3_old_scale, args.eval_k3_old_scale, args.distill_k3_fusion_mode)
         for task_id in range(idx):
             old_model.add_task(task_id)
         old_model.load_param(model_path)
@@ -786,10 +1136,38 @@ for idx, dataset_name in enumerate(training_set):
             find_unused_parameters=True,
         )
 
+    branch_stats_collector = None
+    if args.log_branch_stats:
+        branch_stats_collector = BranchStatsCollector(
+            model,
+            args.logs_dir,
+            parse_branch_log_blocks(args.branch_log_blocks),
+            device,
+            distributed=distributed,
+        )
+        if is_main_process():
+            print('[!INFO] Branch stats enabled: blocks={}, stat_scope={}'.format(
+                args.branch_log_blocks,
+                branch_stats_collector.stat_scope,
+            ))
+
     query_loaders, gall_loaders, query_labels, gall_labels, query_cams, gall_cams = build_test_loaders(idx)
 
     print('==> Start Training...')
     for epoch in range(cfg.START_EPOCH, cfg.MAX_EPOCH + 1):
+        current_train_k3_old_scale = compute_train_k3_old_scale(epoch)
+        configured_k3_banks = set_k3_train_old_scale(model, current_train_k3_old_scale)
+        if is_main_process() and configured_k3_banks > 0:
+            print('[!INFO] Train K3 old scale schedule: stage={}, epoch={}, scale={:.6f}, banks={}, schedule={}, start={}, end={}, warmup_epochs={}'.format(
+                dataset_name,
+                epoch,
+                current_train_k3_old_scale,
+                configured_k3_banks,
+                args.train_k3_old_scale_schedule,
+                args.train_k3_old_scale_start,
+                args.train_k3_old_scale,
+                args.train_k3_old_scale_warmup_epochs,
+            ))
         trainloader = build_train_loader(trainset_rgb, color_pos_rgb, thermal_pos_rgb, idx, epoch)
         model = train(
             epoch,
@@ -811,6 +1189,13 @@ for idx, dataset_name in enumerate(training_set):
 
         if is_main_process():
             log_k3_router_stats(model, phase='train', stage_name=dataset_name, epoch=epoch)
+
+        if branch_stats_collector is not None and args.branch_log_interval > 0 and (epoch % args.branch_log_interval == 0):
+            branch_stats_collector.dump_epoch(dataset_name, idx, epoch)
+
+        if epoch == cfg.MAX_EPOCH and branch_stats_collector is not None:
+            branch_stats_collector.close()
+            branch_stats_collector = None
 
         if epoch == cfg.MAX_EPOCH:
             if is_main_process():
@@ -843,49 +1228,56 @@ for idx, dataset_name in enumerate(training_set):
                 }
                 torch.save(proto_type, osp.join(args.logs_dir, dataset_name + '_proto.pth'))
 
-                head_str, results_str, copy_str = '|', '|', ''
-                stage_metrics = []
-                mean_R1, mean_mAP = 0, 0
-                for ii, testset_name in enumerate(training_set):
-                    if ii > idx:
-                        continue
-                    cmc, mAP, mINP = test(
-                        bare_model,
-                        query_loaders[ii],
-                        gall_loaders[ii],
-                        testset_name,
-                        query_labels[ii],
-                        gall_labels[ii],
-                        query_cams[ii],
-                        gall_cams[ii],
-                        task_id=ii,
-                        stage_name=dataset_name,
-                    )
-                    head_str += testset_name + '|\t'
-                    results_str += '{:.2f}/{:.2f}|\t'.format(mAP * 100, cmc[0] * 100)
-                    copy_str += '{:.2f}\t{:.2f}\t'.format(mAP * 100, cmc[0] * 100)
-                    mean_R1 += cmc[0]
-                    mean_mAP += mAP
-                    stage_metrics.append({
-                        'dataset': testset_name,
-                        'mAP': float(mAP),
-                        'R1': float(cmc[0]),
-                        'mINP': float(mINP),
-                    })
+                for eval_mode in parse_eval_k3_fusion_modes():
+                    set_k3_eval_fusion_mode(bare_model, eval_mode)
+                    print('[!INFO] Eval K3 fusion mode: {}'.format(eval_mode))
 
-                mean_R1 /= (idx + 1)
-                mean_mAP /= (idx + 1)
-                head_str += 'AVG|\t'
-                results_str += '{:.2f}/{:.2f}|\t'.format(mean_mAP * 100, mean_R1 * 100)
-                copy_str += '{:.2f}\t{:.2f}'.format(mean_mAP * 100, mean_R1 * 100)
+                    head_str, results_str, copy_str = '|', '|', ''
+                    stage_metrics = []
+                    mean_R1, mean_mAP = 0, 0
+                    for ii, testset_name in enumerate(training_set):
+                        if ii > idx:
+                            continue
+                        cmc, mAP, mINP = test(
+                            bare_model,
+                            query_loaders[ii],
+                            gall_loaders[ii],
+                            testset_name,
+                            query_labels[ii],
+                            gall_labels[ii],
+                            query_cams[ii],
+                            gall_cams[ii],
+                            task_id=ii,
+                            stage_name=dataset_name,
+                        )
+                        head_str += testset_name + '|\t'
+                        results_str += '{:.2f}/{:.2f}|\t'.format(mAP * 100, cmc[0] * 100)
+                        copy_str += '{:.2f}\t{:.2f}\t'.format(mAP * 100, cmc[0] * 100)
+                        mean_R1 += cmc[0]
+                        mean_mAP += mAP
+                        stage_metrics.append({
+                            'dataset': testset_name,
+                            'mAP': float(mAP),
+                            'R1': float(cmc[0]),
+                            'mINP': float(mINP),
+                        })
 
-                print("Results:")
-                print(head_str)
-                print(results_str)
-                print(copy_str)
-                append_stage_results(dataset_name, idx, stage_metrics)
+                    mean_R1 /= (idx + 1)
+                    mean_mAP /= (idx + 1)
+                    head_str += 'AVG|\t'
+                    results_str += '{:.2f}/{:.2f}|\t'.format(mean_mAP * 100, mean_R1 * 100)
+                    copy_str += '{:.2f}\t{:.2f}'.format(mean_mAP * 100, mean_R1 * 100)
+
+                    print("Results:")
+                    print(head_str)
+                    print(results_str)
+                    print(copy_str)
+                    append_stage_results(dataset_name, idx, stage_metrics, eval_k3_fusion_mode=eval_mode)
                 with open(stage_done_path(dataset_name), 'w', encoding='utf-8') as stage_done_file:
                     stage_done_file.write('done\n')
+
+    if branch_stats_collector is not None:
+        branch_stats_collector.close()
 
 if distributed:
     dist.destroy_process_group()
