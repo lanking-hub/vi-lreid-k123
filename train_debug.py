@@ -116,6 +116,12 @@ parser.add_argument('--dist_backend', type=str, default='nccl', help='distribute
 parser.add_argument('--log_branch_stats', action='store_true', help='record K1/K2/K3 branch contribution statistics during training')
 parser.add_argument('--branch_log_interval', type=int, default=1, help='record branch statistics every N epochs')
 parser.add_argument('--branch_log_blocks', type=str, default='0,3,4,7,8,11', help='comma-separated ViT block ids for branch statistics')
+parser.add_argument('--k1_xmod_align_weight', type=float, default=0.0,
+                    help='weight for K1 block-output cross-modality identity SupCon alignment')
+parser.add_argument('--k1_xmod_align_temp', type=float, default=0.1,
+                    help='temperature for K1 cross-modality identity SupCon alignment')
+parser.add_argument('--k1_align_blocks', type=str, default='4,7',
+                    help='comma-separated ViT block ids used for K1 cross-modality alignment')
 
 args = parser.parse_args()
 
@@ -284,6 +290,9 @@ def append_stage_results(stage_name, stage_idx, metrics, eval_k3_fusion_mode=Non
         'world_size': int(world_size),
         'eval_k3_fusion_mode': eval_mode,
         'distill_k3_fusion_mode': args.distill_k3_fusion_mode,
+        'k1_xmod_align_weight': float(args.k1_xmod_align_weight),
+        'k1_xmod_align_temp': float(args.k1_xmod_align_temp),
+        'k1_align_blocks': args.k1_align_blocks,
     }
 
     with open(results_path, 'a', encoding='utf-8') as results_file:
@@ -296,11 +305,12 @@ def append_stage_results(stage_name, stage_idx, metrics, eval_k3_fusion_mode=Non
                 'stage\tstage_idx\tdataset\tmAP\tR1\tavg_mAP\tavg_R1\troute_tau\t'
                 'train_k3_old_scale\ttrain_k3_old_scale_start\ttrain_k3_old_scale_warmup_epochs\t'
                 'train_k3_old_scale_schedule\teval_k3_old_scale\tdebug_max_epoch\tdebug_batch_size\t'
-                'world_size\teval_k3_fusion_mode\tdistill_k3_fusion_mode\n'
+                'world_size\teval_k3_fusion_mode\tdistill_k3_fusion_mode\t'
+                'k1_xmod_align_weight\tk1_xmod_align_temp\tk1_align_blocks\n'
             )
         for item in metrics:
             summary_file.write(
-                '{}\t{}\t{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format(
+                '{}\t{}\t{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format(
                     stage_name,
                     int(stage_idx),
                     item['dataset'],
@@ -319,6 +329,9 @@ def append_stage_results(stage_name, stage_idx, metrics, eval_k3_fusion_mode=Non
                     world_size,
                     eval_mode,
                     args.distill_k3_fusion_mode,
+                    args.k1_xmod_align_weight,
+                    args.k1_xmod_align_temp,
+                    args.k1_align_blocks,
                 )
             )
 
@@ -794,6 +807,89 @@ class BranchStatsCollector:
         self.records = {}
 
 
+class K1AlignHook:
+    def __init__(self, model, block_ids):
+        self.model = unwrap_model(model)
+        self.block_ids = [int(block_id) for block_id in block_ids]
+        self.handles = []
+        self.outputs = {}
+        self.active = False
+        self._register_hooks()
+
+    def _register_hooks(self):
+        if not hasattr(self.model, 'base') or not hasattr(self.model.base, 'blocks'):
+            raise ValueError('K1 alignment requires model.base.blocks')
+        for block_id in self.block_ids:
+            if block_id < 0 or block_id >= len(self.model.base.blocks):
+                raise ValueError('K1 alignment block id out of range: {}'.format(block_id))
+            block = self.model.base.blocks[block_id]
+            handle = block.register_forward_hook(self._make_hook(block_id))
+            self.handles.append(handle)
+
+    def _make_hook(self, block_id):
+        def hook(module, inputs, output):
+            if not self.active:
+                return
+            if output.dim() < 3:
+                raise ValueError('Expected K1 block output [B, N, C], got shape {}'.format(tuple(output.shape)))
+            self.outputs[block_id] = output[:, 0]
+        return hook
+
+    def reset(self):
+        self.outputs = {}
+
+    def activate(self):
+        self.active = True
+
+    def deactivate(self):
+        self.active = False
+
+    def features(self):
+        if not self.block_ids:
+            return None
+        missing = [block_id for block_id in self.block_ids if block_id not in self.outputs]
+        if missing:
+            return None
+        return torch.cat([self.outputs[block_id] for block_id in self.block_ids], dim=1)
+
+    def close(self):
+        for handle in self.handles:
+            handle.remove()
+        self.handles = []
+        self.outputs = {}
+        self.active = False
+
+
+def cross_modal_supcon_loss(features, labels, mods, temperature=0.1):
+    if features is None:
+        return None
+    if features.shape[0] <= 1:
+        return None
+
+    labels = labels.reshape(-1)
+    mods = mods.reshape(-1)
+    if features.shape[0] != labels.shape[0] or labels.shape[0] != mods.shape[0]:
+        raise ValueError('K1 SupCon feature/label/mod batch size mismatch')
+
+    features = F.normalize(features.float(), p=2, dim=1)
+    logits = torch.matmul(features, features.t()) / float(temperature)
+    logits = logits - logits.max(dim=1, keepdim=True)[0].detach()
+
+    batch_size = labels.shape[0]
+    self_mask = torch.eye(batch_size, device=features.device, dtype=torch.bool)
+    positive_mask = labels.unsqueeze(0).eq(labels.unsqueeze(1)) & mods.unsqueeze(0).ne(mods.unsqueeze(1)) & (~self_mask)
+    logits_mask = ~self_mask
+    positive_count = positive_mask.sum(dim=1)
+    valid_anchor = positive_count > 0
+    if not valid_anchor.any():
+        return None
+
+    exp_logits = torch.exp(logits) * logits_mask.to(dtype=logits.dtype)
+    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True).clamp_min(1e-12))
+    positive_log_prob = (positive_mask.to(dtype=log_prob.dtype) * log_prob).sum(dim=1) / positive_count.clamp_min(1).to(dtype=log_prob.dtype)
+    return -positive_log_prob[valid_anchor].mean()
+
+
 def build_train_loader(trainset_rgb, color_pos_rgb, thermal_pos_rgb, stage_id, epoch):
     index1, index2 = build_epoch_sampler_indices(trainset_rgb, color_pos_rgb, thermal_pos_rgb, stage_id, epoch)
     local_batch_size = get_local_batch_size()
@@ -877,10 +973,11 @@ def build_test_loaders(current_stage_idx):
 
 def train(epoch, stage_id, model, old_model, scheduler, optimizer, scaler, trainloader,
           criterion_id, criterion_tri, criterion_tricros, criterion_tricent, kldiv_loss,
-          vis_features_mean, inf_features_mean):
+          vis_features_mean, inf_features_mean, k1_align_hook=None):
     loss_meter = AverageMeter()
     loss_ce_meter = AverageMeter()
     loss_tri_meter = AverageMeter()
+    loss_k1_xmod_meter = AverageMeter()
     acc_rgb_meter = AverageMeter()
     acc_ir_meter = AverageMeter()
     epoch_start_time = time.time()
@@ -896,6 +993,10 @@ def train(epoch, stage_id, model, old_model, scheduler, optimizer, scaler, train
         label2 = label2.to(device, non_blocking=True)
         labels = torch.cat((label1, label2), 0)
         mods = torch.cat([torch.ones_like(label1), torch.zeros_like(label2)])
+
+        if k1_align_hook is not None:
+            k1_align_hook.reset()
+            k1_align_hook.activate()
 
         with autocast_context():
             scores, feats = model(torch.cat([input1, input2]), mods, task_id=stage_id)
@@ -923,6 +1024,13 @@ def train(epoch, stage_id, model, old_model, scheduler, optimizer, scaler, train
 
             global_pair_loss = (1 - args.cross_weight) * loss_tri_cent + args.cross_weight * loss_tri_cross
             loss += args.new_weight * global_pair_loss * world_size
+
+            loss_k1_xmod = None
+            if k1_align_hook is not None:
+                k1_features = k1_align_hook.features()
+                loss_k1_xmod = cross_modal_supcon_loss(k1_features, labels, mods, args.k1_xmod_align_temp)
+                if loss_k1_xmod is not None:
+                    loss += args.k1_xmod_align_weight * loss_k1_xmod
 
             if old_model is not None:
                 old_model.eval()
@@ -966,6 +1074,9 @@ def train(epoch, stage_id, model, old_model, scheduler, optimizer, scaler, train
 
                 loss += args.proto_weight * ((1 - args.inter_weight) * div_1 + args.inter_weight * div_2)
 
+        if k1_align_hook is not None:
+            k1_align_hook.deactivate()
+
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -976,6 +1087,7 @@ def train(epoch, stage_id, model, old_model, scheduler, optimizer, scaler, train
         loss_tri_meter.update(loss_tri.item())
         loss_ce_meter.update(loss_id.item())
         loss_meter.update(loss.item())
+        loss_k1_xmod_meter.update(0.0 if loss_k1_xmod is None else loss_k1_xmod.item())
         acc_rgb_meter.update(acc_rgb.item(), 1)
         acc_ir_meter.update(acc_ir.item(), 1)
 
@@ -990,6 +1102,7 @@ def train(epoch, stage_id, model, old_model, scheduler, optimizer, scaler, train
             samples_per_second = samples_seen / elapsed
             print('Epoch[{}] Iteration[{}/{}]'
                   ' Loss: {:.3f}, Tri:{:.3f} CE:{:.3f}, '
+                  'K1XMod:{:.3f}, '
                   'Acc_RGB: {:.3f}, Acc_IR: {:.3f}, '
                   'Base Lr: {:.2e}, Time: {:.1f}s, Global Img/s: {:.2f} '.format(
                       epoch,
@@ -998,6 +1111,7 @@ def train(epoch, stage_id, model, old_model, scheduler, optimizer, scaler, train
                       reduce_mean_scalar(loss_meter.avg),
                       reduce_mean_scalar(loss_tri_meter.avg),
                       reduce_mean_scalar(loss_ce_meter.avg),
+                      reduce_mean_scalar(loss_k1_xmod_meter.avg),
                       reduce_mean_scalar(acc_rgb_meter.avg),
                       reduce_mean_scalar(acc_ir_meter.avg),
                       optimizer.state_dict()['param_groups'][0]['lr'],
@@ -1151,6 +1265,19 @@ for idx, dataset_name in enumerate(training_set):
                 branch_stats_collector.stat_scope,
             ))
 
+    k1_align_hook = None
+    if args.k1_xmod_align_weight > 0:
+        k1_align_blocks = parse_branch_log_blocks(args.k1_align_blocks)
+        if not k1_align_blocks:
+            raise ValueError('--k1_align_blocks must not be empty when K1 alignment is enabled')
+        k1_align_hook = K1AlignHook(model, k1_align_blocks)
+        if is_main_process():
+            print('[!INFO] K1 cross-modal alignment enabled: blocks={}, weight={}, temp={}'.format(
+                args.k1_align_blocks,
+                args.k1_xmod_align_weight,
+                args.k1_xmod_align_temp,
+            ))
+
     query_loaders, gall_loaders, query_labels, gall_labels, query_cams, gall_cams = build_test_loaders(idx)
 
     print('==> Start Training...')
@@ -1185,6 +1312,7 @@ for idx, dataset_name in enumerate(training_set):
             KLDivLoss,
             vis_features_mean,
             inf_features_mean,
+            k1_align_hook=k1_align_hook,
         )
 
         if is_main_process():
@@ -1196,6 +1324,10 @@ for idx, dataset_name in enumerate(training_set):
         if epoch == cfg.MAX_EPOCH and branch_stats_collector is not None:
             branch_stats_collector.close()
             branch_stats_collector = None
+
+        if epoch == cfg.MAX_EPOCH and k1_align_hook is not None:
+            k1_align_hook.close()
+            k1_align_hook = None
 
         if epoch == cfg.MAX_EPOCH:
             if is_main_process():
@@ -1278,6 +1410,8 @@ for idx, dataset_name in enumerate(training_set):
 
     if branch_stats_collector is not None:
         branch_stats_collector.close()
+    if k1_align_hook is not None:
+        k1_align_hook.close()
 
 if distributed:
     dist.destroy_process_group()
