@@ -117,11 +117,20 @@ parser.add_argument('--log_branch_stats', action='store_true', help='record K1/K
 parser.add_argument('--branch_log_interval', type=int, default=1, help='record branch statistics every N epochs')
 parser.add_argument('--branch_log_blocks', type=str, default='0,3,4,7,8,11', help='comma-separated ViT block ids for branch statistics')
 parser.add_argument('--k1_xmod_align_weight', type=float, default=0.0,
-                    help='weight for K1 block-output cross-modality identity SupCon alignment')
+                    help='weight for K1 cross-modality identity SupCon alignment')
 parser.add_argument('--k1_xmod_align_temp', type=float, default=0.1,
                     help='temperature for K1 cross-modality identity SupCon alignment')
+parser.add_argument('--k1_xmod_align_source', type=str, default='block_output',
+                    choices=['block_output', 'scaled_delta', 'scaled_delta_detached'],
+                    help='feature source for K1 cross-modality alignment')
 parser.add_argument('--k1_align_blocks', type=str, default='4,7',
                     help='comma-separated ViT block ids used for K1 cross-modality alignment')
+parser.add_argument('--k1_align_modules', type=str, default='qkv,proj',
+                    help='comma-separated attention modules used for K1 delta alignment')
+parser.add_argument('--k1_norm_guard_weight', type=float, default=0.0,
+                    help='optional weight for K1 scaled-delta norm floor loss')
+parser.add_argument('--k1_norm_guard_target', type=float, default=0.02,
+                    help='target mean norm for optional K1 scaled-delta norm floor loss')
 
 args = parser.parse_args()
 
@@ -290,9 +299,13 @@ def append_stage_results(stage_name, stage_idx, metrics, eval_k3_fusion_mode=Non
         'world_size': int(world_size),
         'eval_k3_fusion_mode': eval_mode,
         'distill_k3_fusion_mode': args.distill_k3_fusion_mode,
+        'k1_xmod_align_source': args.k1_xmod_align_source,
         'k1_xmod_align_weight': float(args.k1_xmod_align_weight),
         'k1_xmod_align_temp': float(args.k1_xmod_align_temp),
         'k1_align_blocks': args.k1_align_blocks,
+        'k1_align_modules': args.k1_align_modules,
+        'k1_norm_guard_weight': float(args.k1_norm_guard_weight),
+        'k1_norm_guard_target': float(args.k1_norm_guard_target),
     }
 
     with open(results_path, 'a', encoding='utf-8') as results_file:
@@ -306,11 +319,12 @@ def append_stage_results(stage_name, stage_idx, metrics, eval_k3_fusion_mode=Non
                 'train_k3_old_scale\ttrain_k3_old_scale_start\ttrain_k3_old_scale_warmup_epochs\t'
                 'train_k3_old_scale_schedule\teval_k3_old_scale\tdebug_max_epoch\tdebug_batch_size\t'
                 'world_size\teval_k3_fusion_mode\tdistill_k3_fusion_mode\t'
-                'k1_xmod_align_weight\tk1_xmod_align_temp\tk1_align_blocks\n'
+                'k1_xmod_align_source\tk1_xmod_align_weight\tk1_xmod_align_temp\t'
+                'k1_align_blocks\tk1_align_modules\tk1_norm_guard_weight\tk1_norm_guard_target\n'
             )
         for item in metrics:
             summary_file.write(
-                '{}\t{}\t{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format(
+                '{}\t{}\t{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format(
                     stage_name,
                     int(stage_idx),
                     item['dataset'],
@@ -329,9 +343,13 @@ def append_stage_results(stage_name, stage_idx, metrics, eval_k3_fusion_mode=Non
                     world_size,
                     eval_mode,
                     args.distill_k3_fusion_mode,
+                    args.k1_xmod_align_source,
                     args.k1_xmod_align_weight,
                     args.k1_xmod_align_temp,
                     args.k1_align_blocks,
+                    args.k1_align_modules,
+                    args.k1_norm_guard_weight,
+                    args.k1_norm_guard_target,
                 )
             )
 
@@ -360,6 +378,38 @@ def parse_branch_log_blocks(value):
             continue
         block_ids.append(int(part))
     return block_ids
+
+
+def parse_k1_align_modules(value):
+    valid_modules = {'qkv', 'proj'}
+    if value is None or str(value).strip() == '':
+        return []
+    module_names = []
+    for part in str(value).split(','):
+        module_name = part.strip()
+        if not module_name:
+            continue
+        if module_name not in valid_modules:
+            raise ValueError('Unsupported K1 alignment module: {}'.format(module_name))
+        if module_name not in module_names:
+            module_names.append(module_name)
+    return module_names
+
+
+def parse_attn_branch_module_name(name):
+    parts = name.split('.')
+    if len(parts) != 5:
+        return None
+    if parts[0] != 'base' or parts[1] != 'blocks' or parts[3] != 'attn':
+        return None
+    try:
+        block_id = int(parts[2])
+    except ValueError:
+        return None
+    branch_name = parts[4]
+    if branch_name not in ('qkv', 'proj'):
+        return None
+    return block_id, branch_name
 
 
 def parse_eval_k3_fusion_modes():
@@ -808,9 +858,11 @@ class BranchStatsCollector:
 
 
 class K1AlignHook:
-    def __init__(self, model, block_ids):
+    def __init__(self, model, block_ids, branch_names, source):
         self.model = unwrap_model(model)
         self.block_ids = [int(block_id) for block_id in block_ids]
+        self.branch_names = list(branch_names)
+        self.source = str(source)
         self.handles = []
         self.outputs = {}
         self.active = False
@@ -819,20 +871,59 @@ class K1AlignHook:
     def _register_hooks(self):
         if not hasattr(self.model, 'base') or not hasattr(self.model.base, 'blocks'):
             raise ValueError('K1 alignment requires model.base.blocks')
-        for block_id in self.block_ids:
-            if block_id < 0 or block_id >= len(self.model.base.blocks):
-                raise ValueError('K1 alignment block id out of range: {}'.format(block_id))
-            block = self.model.base.blocks[block_id]
-            handle = block.register_forward_hook(self._make_hook(block_id))
-            self.handles.append(handle)
+        if self.source == 'block_output':
+            for block_id in self.block_ids:
+                if block_id < 0 or block_id >= len(self.model.base.blocks):
+                    raise ValueError('K1 alignment block id out of range: {}'.format(block_id))
+                block = self.model.base.blocks[block_id]
+                module_name = 'base.blocks.{}'.format(block_id)
+                handle = block.register_forward_hook(self._make_block_hook(module_name))
+                self.handles.append(handle)
+            return
 
-    def _make_hook(self, block_id):
+        if self.source not in ('scaled_delta', 'scaled_delta_detached'):
+            raise ValueError('Unsupported K1 alignment source: {}'.format(self.source))
+
+        block_set = set(self.block_ids)
+        branch_set = set(self.branch_names)
+        for name, module in self.model.named_modules():
+            parsed = parse_attn_branch_module_name(name)
+            if parsed is None:
+                continue
+            block_id, branch_name = parsed
+            if block_id not in block_set or branch_name not in branch_set:
+                continue
+            if not hasattr(module, 'compute_k1_alignment_delta'):
+                continue
+            if getattr(module, 'shared_adapter', None) is None:
+                continue
+            handle = module.register_forward_hook(self._make_delta_hook(name))
+            self.handles.append(handle)
+        if not self.handles:
+            raise ValueError('No K1 alignment modules matched blocks={} modules={}'.format(
+                self.block_ids, self.branch_names))
+
+    def _pool_cls(self, tensor):
+        if tensor.dim() < 3:
+            raise ValueError('Expected K1 alignment tensor [B, N, C], got shape {}'.format(tuple(tensor.shape)))
+        return tensor[:, 0]
+
+    def _make_block_hook(self, module_name):
         def hook(module, inputs, output):
             if not self.active:
                 return
-            if output.dim() < 3:
-                raise ValueError('Expected K1 block output [B, N, C], got shape {}'.format(tuple(output.shape)))
-            self.outputs[block_id] = output[:, 0]
+            self.outputs[module_name] = self._pool_cls(output)
+        return hook
+
+    def _make_delta_hook(self, module_name):
+        def hook(module, inputs, output):
+            if not self.active:
+                return
+            detach_input = self.source == 'scaled_delta_detached'
+            scaled_delta = module.compute_k1_alignment_delta(inputs[0], detach_input=detach_input, scaled=True)
+            if scaled_delta is None:
+                return
+            self.outputs[module_name] = self._pool_cls(scaled_delta)
         return hook
 
     def reset(self):
@@ -845,12 +936,16 @@ class K1AlignHook:
         self.active = False
 
     def features(self):
-        if not self.block_ids:
+        if not self.outputs:
             return None
-        missing = [block_id for block_id in self.block_ids if block_id not in self.outputs]
-        if missing:
+        return torch.cat([self.outputs[key] for key in sorted(self.outputs)], dim=1)
+
+    def feature_norm(self):
+        features = self.features()
+        if features is None:
             return None
-        return torch.cat([self.outputs[block_id] for block_id in self.block_ids], dim=1)
+        flat = features.float().reshape(features.shape[0], -1)
+        return torch.linalg.vector_norm(flat, dim=1).mean()
 
     def close(self):
         for handle in self.handles:
@@ -978,6 +1073,8 @@ def train(epoch, stage_id, model, old_model, scheduler, optimizer, scaler, train
     loss_ce_meter = AverageMeter()
     loss_tri_meter = AverageMeter()
     loss_k1_xmod_meter = AverageMeter()
+    loss_k1_norm_guard_meter = AverageMeter()
+    k1_delta_norm_meter = AverageMeter()
     acc_rgb_meter = AverageMeter()
     acc_ir_meter = AverageMeter()
     epoch_start_time = time.time()
@@ -1026,11 +1123,26 @@ def train(epoch, stage_id, model, old_model, scheduler, optimizer, scaler, train
             loss += args.new_weight * global_pair_loss * world_size
 
             loss_k1_xmod = None
+            loss_k1_norm_guard = None
+            k1_delta_norm = None
             if k1_align_hook is not None:
                 k1_features = k1_align_hook.features()
+                k1_delta_norm = k1_align_hook.feature_norm()
                 loss_k1_xmod = cross_modal_supcon_loss(k1_features, labels, mods, args.k1_xmod_align_temp)
                 if loss_k1_xmod is not None:
                     loss += args.k1_xmod_align_weight * loss_k1_xmod
+                if (
+                    k1_delta_norm is not None
+                    and args.k1_norm_guard_weight > 0
+                    and args.k1_xmod_align_source != 'block_output'
+                ):
+                    target_norm = torch.tensor(
+                        float(args.k1_norm_guard_target),
+                        device=k1_delta_norm.device,
+                        dtype=k1_delta_norm.dtype,
+                    )
+                    loss_k1_norm_guard = F.relu(target_norm - k1_delta_norm)
+                    loss += args.k1_norm_guard_weight * loss_k1_norm_guard
 
             if old_model is not None:
                 old_model.eval()
@@ -1088,6 +1200,8 @@ def train(epoch, stage_id, model, old_model, scheduler, optimizer, scaler, train
         loss_ce_meter.update(loss_id.item())
         loss_meter.update(loss.item())
         loss_k1_xmod_meter.update(0.0 if loss_k1_xmod is None else loss_k1_xmod.item())
+        loss_k1_norm_guard_meter.update(0.0 if loss_k1_norm_guard is None else loss_k1_norm_guard.item())
+        k1_delta_norm_meter.update(0.0 if k1_delta_norm is None else k1_delta_norm.item())
         acc_rgb_meter.update(acc_rgb.item(), 1)
         acc_ir_meter.update(acc_ir.item(), 1)
 
@@ -1102,7 +1216,7 @@ def train(epoch, stage_id, model, old_model, scheduler, optimizer, scaler, train
             samples_per_second = samples_seen / elapsed
             print('Epoch[{}] Iteration[{}/{}]'
                   ' Loss: {:.3f}, Tri:{:.3f} CE:{:.3f}, '
-                  'K1XMod:{:.3f}, '
+                  'K1XMod:{:.3f}, K1Norm:{:.4f}, K1Guard:{:.4f}, '
                   'Acc_RGB: {:.3f}, Acc_IR: {:.3f}, '
                   'Base Lr: {:.2e}, Time: {:.1f}s, Global Img/s: {:.2f} '.format(
                       epoch,
@@ -1112,6 +1226,8 @@ def train(epoch, stage_id, model, old_model, scheduler, optimizer, scaler, train
                       reduce_mean_scalar(loss_tri_meter.avg),
                       reduce_mean_scalar(loss_ce_meter.avg),
                       reduce_mean_scalar(loss_k1_xmod_meter.avg),
+                      reduce_mean_scalar(k1_delta_norm_meter.avg),
+                      reduce_mean_scalar(loss_k1_norm_guard_meter.avg),
                       reduce_mean_scalar(acc_rgb_meter.avg),
                       reduce_mean_scalar(acc_ir_meter.avg),
                       optimizer.state_dict()['param_groups'][0]['lr'],
@@ -1266,16 +1382,28 @@ for idx, dataset_name in enumerate(training_set):
             ))
 
     k1_align_hook = None
-    if args.k1_xmod_align_weight > 0:
+    if args.k1_xmod_align_weight > 0 or args.k1_norm_guard_weight > 0:
         k1_align_blocks = parse_branch_log_blocks(args.k1_align_blocks)
         if not k1_align_blocks:
             raise ValueError('--k1_align_blocks must not be empty when K1 alignment is enabled')
-        k1_align_hook = K1AlignHook(model, k1_align_blocks)
+        k1_align_modules = parse_k1_align_modules(args.k1_align_modules)
+        if args.k1_xmod_align_source != 'block_output' and not k1_align_modules:
+            raise ValueError('--k1_align_modules must not be empty for K1 delta alignment')
+        k1_align_hook = K1AlignHook(
+            model,
+            k1_align_blocks,
+            k1_align_modules,
+            args.k1_xmod_align_source,
+        )
         if is_main_process():
-            print('[!INFO] K1 cross-modal alignment enabled: blocks={}, weight={}, temp={}'.format(
+            print('[!INFO] K1 cross-modal alignment enabled: source={}, blocks={}, modules={}, weight={}, temp={}, norm_guard_weight={}, norm_guard_target={}'.format(
+                args.k1_xmod_align_source,
                 args.k1_align_blocks,
+                args.k1_align_modules,
                 args.k1_xmod_align_weight,
                 args.k1_xmod_align_temp,
+                args.k1_norm_guard_weight,
+                args.k1_norm_guard_target,
             ))
 
     query_loaders, gall_loaders, query_labels, gall_labels, query_cams, gall_cams = build_test_loaders(idx)

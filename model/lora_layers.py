@@ -291,6 +291,15 @@ class LoRALinearWithBranches(nn.Module):
                 dtype=self.base.weight.dtype,
             )
 
+    def compute_k1_alignment_delta(self, x, detach_input=True, scaled=True):
+        if self.shared_adapter is None:
+            return None
+        align_input = x.detach() if detach_input else x
+        delta_k1 = self.shared_adapter(align_input)
+        if scaled:
+            return self.gamma_k1 * delta_k1
+        return delta_k1
+
     def _expand_mod_mask(self, mod, x):
         if not torch.is_tensor(mod):
             mod = torch.as_tensor(mod, device=x.device)
