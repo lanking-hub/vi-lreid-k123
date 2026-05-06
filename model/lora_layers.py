@@ -61,6 +61,10 @@ class TaskLoRABank(nn.Module):
         self.train_old_scale = train_old_scale
         self.eval_old_scale = eval_old_scale
         self.eval_fusion_mode = eval_fusion_mode
+        self.k3_topk_old = 0
+        self.k3_gate_mode = "none"
+        self.k3_gate_threshold = 0.0
+        self.k3_gate_min = 0.0
         self.experts = nn.ModuleDict()
         self.last_old_keys = []
         self.last_old_weights = None
@@ -68,6 +72,12 @@ class TaskLoRABank(nn.Module):
         self.last_old_weight_entropy = None
         self.last_mu_cur_norm = None
         self.last_old_mu_norms = None
+        self.last_raw_old_weights = None
+        self.last_sparse_old_weights = None
+        self.last_selected_old_keys = []
+        self.last_route_confidence = None
+        self.last_route_gate = None
+        self.last_effective_old_scale = None
         self.enable_branch_stats = False
         self.last_branch_outputs = None
 
@@ -146,6 +156,39 @@ class TaskLoRABank(nn.Module):
         old_mu_norms = torch.stack(old_mu_norms, dim=0)
         return weights, similarities, old_mu_norms
 
+    def _apply_sparse_old_weights(self, old_keys, weights):
+        # weights is 1D [num_old_experts] for batch-level router.
+        # If per-sample routing is added later, selected_keys construction needs updating.
+        topk = self.k3_topk_old
+        if topk <= 0 or topk >= len(old_keys):
+            return list(old_keys), weights
+        top_values, top_indices = torch.topk(weights, k=topk, dim=-1)
+        sparse_weights = torch.zeros_like(weights)
+        sparse_weights.scatter_(-1, top_indices, top_values)
+        sparse_weights = sparse_weights / (sparse_weights.sum(dim=-1, keepdim=True) + self.route_eps)
+        selected_keys = [old_keys[i] for i in top_indices.tolist()]
+        return selected_keys, sparse_weights
+
+    def _compute_route_gate(self, weights):
+        gate_mode = self.k3_gate_mode
+        threshold = min(max(float(self.k3_gate_threshold), 0.0), 1.0)
+        gate_min = min(max(float(self.k3_gate_min), 0.0), 1.0)
+        if gate_mode == "none" or threshold >= 1.0:
+            return torch.tensor(1.0, device=weights.device, dtype=weights.dtype)
+        if gate_mode == "max_weight":
+            confidence = weights.max(dim=-1).values
+        elif gate_mode == "margin":
+            if weights.shape[-1] < 2:
+                confidence = weights.max(dim=-1).values
+            else:
+                top2 = torch.topk(weights, k=2, dim=-1).values
+                confidence = top2[..., 0] - top2[..., 1]
+        else:
+            return torch.tensor(1.0, device=weights.device, dtype=weights.dtype)
+        gate = torch.clamp((confidence - threshold) / (1.0 - threshold), 0.0, 1.0)
+        gate = gate_min + (1.0 - gate_min) * gate
+        return gate
+
     def _record_route_debug(self, old_keys, weights, similarities, mu_cur, old_mu_norms):
         self.last_old_keys = list(old_keys)
         self.last_old_weights = None if weights is None else weights.detach().cpu()
@@ -156,6 +199,23 @@ class TaskLoRABank(nn.Module):
             self.last_old_weight_entropy = entropy.detach().cpu()
         self.last_mu_cur_norm = mu_cur.detach().norm().cpu()
         self.last_old_mu_norms = None if old_mu_norms is None else old_mu_norms.detach().cpu()
+
+    def _clear_k3_gate_debug(self):
+        self.last_raw_old_weights = None
+        self.last_sparse_old_weights = None
+        self.last_selected_old_keys = []
+        self.last_route_confidence = None
+        self.last_route_gate = None
+        self.last_effective_old_scale = None
+
+    def _clear_route_debug(self):
+        self.last_old_keys = []
+        self.last_old_weights = None
+        self.last_old_similarities = None
+        self.last_old_weight_entropy = None
+        self.last_mu_cur_norm = None
+        self.last_old_mu_norms = None
+        self._clear_k3_gate_debug()
 
     def get_route_debug_snapshot(self):
         active_old_scale = self.train_old_scale if self.training else self.eval_old_scale
@@ -171,6 +231,16 @@ class TaskLoRABank(nn.Module):
             "train_old_scale": self.train_old_scale,
             "eval_old_scale": self.eval_old_scale,
             "eval_fusion_mode": self.eval_fusion_mode,
+            "raw_weights": None if self.last_raw_old_weights is None else self.last_raw_old_weights.clone(),
+            "sparse_weights": None if self.last_sparse_old_weights is None else self.last_sparse_old_weights.clone(),
+            "selected_old_keys": list(self.last_selected_old_keys),
+            "confidence": None if self.last_route_confidence is None else self.last_route_confidence.clone(),
+            "gate": None if self.last_route_gate is None else self.last_route_gate.clone(),
+            "effective_old_scale": None if self.last_effective_old_scale is None else self.last_effective_old_scale.clone(),
+            "topk_old": self.k3_topk_old,
+            "gate_mode": self.k3_gate_mode,
+            "gate_threshold": self.k3_gate_threshold,
+            "gate_min": self.k3_gate_min,
         }
 
     def _record_branch_outputs(self, current_out, old_scaled_out):
@@ -200,6 +270,7 @@ class TaskLoRABank(nn.Module):
     def forward(self, x, task_id=None):
         self.last_branch_outputs = None
         if task_id is None:
+            self._clear_route_debug()
             empty_out = x.new_zeros(*x.shape[:-1], self.out_features)
             self._record_branch_outputs(empty_out, empty_out)
             return empty_out
@@ -214,19 +285,44 @@ class TaskLoRABank(nn.Module):
         current_out = self.experts[key](x)
         old_keys = self._get_fusion_task_keys(key)
         if not old_keys:
+            self._clear_k3_gate_debug()
             self._record_route_debug(old_keys, None, None, mu_cur, None)
             self._record_branch_outputs(current_out, torch.zeros_like(current_out))
             return current_out
 
         weights, similarities, old_mu_norms = self._compute_old_weights(mu_cur, old_keys)
+        self.last_raw_old_weights = weights.detach().clone()
+
+        selected_old_keys, sparse_weights = self._apply_sparse_old_weights(old_keys, weights)
+        self.last_sparse_old_weights = sparse_weights.detach().clone()
+        self.last_selected_old_keys = list(selected_old_keys)
+
+        gate = self._compute_route_gate(weights)
+        self.last_route_confidence = None
+        if self.k3_gate_mode != "none":
+            if self.k3_gate_mode == "max_weight":
+                self.last_route_confidence = weights.max(dim=-1).values.detach().clone()
+            elif self.k3_gate_mode == "margin":
+                if weights.shape[-1] < 2:
+                    self.last_route_confidence = weights.max(dim=-1).values.detach().clone()
+                else:
+                    top2 = torch.topk(weights, k=2, dim=-1).values
+                    self.last_route_confidence = (top2[..., 0] - top2[..., 1]).detach().clone()
+        self.last_route_gate = gate.detach().clone()
+
         old_out = x.new_zeros(*x.shape[:-1], self.out_features)
         with torch.no_grad():
             for idx, old_key in enumerate(old_keys):
-                old_out = old_out + weights[idx].to(device=x.device, dtype=x.dtype) * self.experts[old_key](x)
+                weight = sparse_weights[idx].to(device=x.device, dtype=x.dtype)
+                if weight.abs().item() <= self.route_eps:
+                    continue
+                old_out = old_out + weight * self.experts[old_key](x)
 
-        self._record_route_debug(old_keys, weights, similarities, mu_cur, old_mu_norms)
+        self._record_route_debug(old_keys, sparse_weights, similarities, mu_cur, old_mu_norms)
         old_scale = self.train_old_scale if self.training else self.eval_old_scale
-        old_scaled_out = old_scale * old_out
+        effective_old_scale = old_scale * gate
+        self.last_effective_old_scale = effective_old_scale.detach().clone()
+        old_scaled_out = effective_old_scale * old_out
         self._record_branch_outputs(current_out, old_scaled_out)
         return current_out + old_scaled_out
 

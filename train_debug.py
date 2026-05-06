@@ -131,6 +131,15 @@ parser.add_argument('--k1_norm_guard_weight', type=float, default=0.0,
                     help='optional weight for K1 scaled-delta norm floor loss')
 parser.add_argument('--k1_norm_guard_target', type=float, default=0.02,
                     help='target mean norm for optional K1 scaled-delta norm floor loss')
+parser.add_argument('--k3_topk_old', type=int, default=0,
+                    help='top-k old experts for K3 fusion (0=all, 1=top-1, etc.)')
+parser.add_argument('--k3_gate_mode', type=str, default='none',
+                    choices=['none', 'max_weight', 'margin'],
+                    help='K3 old fusion confidence gate mode')
+parser.add_argument('--k3_gate_threshold', type=float, default=0.0,
+                    help='confidence threshold for K3 gate (gate=0 below this)')
+parser.add_argument('--k3_gate_min', type=float, default=0.0,
+                    help='minimum gate value even when confidence is below threshold')
 
 args = parser.parse_args()
 
@@ -306,6 +315,10 @@ def append_stage_results(stage_name, stage_idx, metrics, eval_k3_fusion_mode=Non
         'k1_align_modules': args.k1_align_modules,
         'k1_norm_guard_weight': float(args.k1_norm_guard_weight),
         'k1_norm_guard_target': float(args.k1_norm_guard_target),
+        'k3_topk_old': int(args.k3_topk_old),
+        'k3_gate_mode': args.k3_gate_mode,
+        'k3_gate_threshold': float(args.k3_gate_threshold),
+        'k3_gate_min': float(args.k3_gate_min),
     }
 
     with open(results_path, 'a', encoding='utf-8') as results_file:
@@ -320,11 +333,12 @@ def append_stage_results(stage_name, stage_idx, metrics, eval_k3_fusion_mode=Non
                 'train_k3_old_scale_schedule\teval_k3_old_scale\tdebug_max_epoch\tdebug_batch_size\t'
                 'world_size\teval_k3_fusion_mode\tdistill_k3_fusion_mode\t'
                 'k1_xmod_align_source\tk1_xmod_align_weight\tk1_xmod_align_temp\t'
-                'k1_align_blocks\tk1_align_modules\tk1_norm_guard_weight\tk1_norm_guard_target\n'
+                'k1_align_blocks\tk1_align_modules\tk1_norm_guard_weight\tk1_norm_guard_target\t'
+                'k3_topk_old\tk3_gate_mode\tk3_gate_threshold\tk3_gate_min\n'
             )
         for item in metrics:
             summary_file.write(
-                '{}\t{}\t{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format(
+                '{}\t{}\t{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format(
                     stage_name,
                     int(stage_idx),
                     item['dataset'],
@@ -350,6 +364,10 @@ def append_stage_results(stage_name, stage_idx, metrics, eval_k3_fusion_mode=Non
                     args.k1_align_modules,
                     args.k1_norm_guard_weight,
                     args.k1_norm_guard_target,
+                    args.k3_topk_old,
+                    args.k3_gate_mode,
+                    args.k3_gate_threshold,
+                    args.k3_gate_min,
                 )
             )
 
@@ -496,7 +514,8 @@ def freeze_backbone_except_lora(model):
         frozen_params, trainable_params))
 
 
-def configure_k3_router(model, route_tau, train_old_scale, eval_old_scale, eval_fusion_mode):
+def configure_k3_router(model, route_tau, train_old_scale, eval_old_scale, eval_fusion_mode,
+                        topk_old=0, gate_mode='none', gate_threshold=0.0, gate_min=0.0):
     bare_model = unwrap_model(model)
     configured = 0
     for module in bare_model.modules():
@@ -510,10 +529,17 @@ def configure_k3_router(model, route_tau, train_old_scale, eval_old_scale, eval_
             task_bank.eval_old_scale = float(eval_old_scale)
         if hasattr(task_bank, 'eval_fusion_mode'):
             task_bank.eval_fusion_mode = str(eval_fusion_mode)
+        task_bank.k3_topk_old = int(topk_old)
+        task_bank.k3_gate_mode = str(gate_mode)
+        task_bank.k3_gate_threshold = float(gate_threshold)
+        task_bank.k3_gate_min = float(gate_min)
         configured += 1
     if configured > 0:
-        print('[!INFO] Configure K3 router: banks={}, route_tau={}, train_k3_old_scale={}, eval_k3_old_scale={}, eval_k3_fusion_mode={}'.format(
-            configured, route_tau, train_old_scale, eval_old_scale, eval_fusion_mode))
+        gate_info = ''
+        if gate_mode != 'none':
+            gate_info = ', gate={}:t={}:min={}'.format(gate_mode, gate_threshold, gate_min)
+        print('[!INFO] Configure K3 router: banks={}, route_tau={}, train_k3_old_scale={}, eval_k3_old_scale={}, eval_k3_fusion_mode={}, topk_old={}{}'.format(
+            configured, route_tau, train_old_scale, eval_old_scale, eval_fusion_mode, topk_old, gate_info))
 
 
 def compute_train_k3_old_scale(epoch):
@@ -592,7 +618,7 @@ def log_k3_router_stats(model, phase, stage_name, epoch=None, eval_name=None):
             if not old_keys:
                 continue
             logs.append(
-                'b{}.{} keys={} w={} sim={} ent={} tau={} old_scale={}'.format(
+                'b{}.{} keys={} w={} sim={} ent={} tau={} old_scale={} gate={} eff_scale={}'.format(
                     block_idx,
                     branch_name,
                     _fmt_router_values(old_keys),
@@ -601,6 +627,8 @@ def log_k3_router_stats(model, phase, stage_name, epoch=None, eval_name=None):
                     _fmt_router_values(snapshot['entropy']),
                     _fmt_router_values(snapshot['tau']),
                     _fmt_router_values(snapshot.get('old_scale')),
+                    _fmt_router_values(snapshot.get('gate')),
+                    _fmt_router_values(snapshot.get('effective_old_scale')),
                 )
             )
 
@@ -786,6 +814,16 @@ class BranchStatsCollector:
                     'old_scale': float(snapshot.get('old_scale')),
                     'weights': [float(value) for value in weights.tolist()],
                     'similarities': None if snapshot.get('similarities') is None else [float(value) for value in snapshot['similarities'].tolist()],
+                    'raw_weights': None if snapshot.get('raw_weights') is None else [float(value) for value in snapshot['raw_weights'].tolist()],
+                    'sparse_weights': None if snapshot.get('sparse_weights') is None else [float(value) for value in snapshot['sparse_weights'].tolist()],
+                    'selected_old_keys': snapshot.get('selected_old_keys'),
+                    'confidence': None if snapshot.get('confidence') is None else float(snapshot['confidence'].item()),
+                    'gate': None if snapshot.get('gate') is None else float(snapshot['gate'].item()),
+                    'effective_old_scale': None if snapshot.get('effective_old_scale') is None else float(snapshot['effective_old_scale'].item()),
+                    'topk_old': snapshot.get('topk_old'),
+                    'gate_mode': snapshot.get('gate_mode'),
+                    'gate_threshold': snapshot.get('gate_threshold'),
+                    'gate_min': snapshot.get('gate_min'),
                 })
         return rows
 
@@ -1291,7 +1329,9 @@ for idx, dataset_name in enumerate(training_set):
 
     base_model = build_vision_transformer(num_classes=num_classes, cfg=cfg)
     base_model.to(device)
-    configure_k3_router(base_model, args.route_tau, args.train_k3_old_scale, args.eval_k3_old_scale, args.eval_k3_fusion_mode)
+    configure_k3_router(base_model, args.route_tau, args.train_k3_old_scale, args.eval_k3_old_scale, args.eval_k3_fusion_mode,
+                        topk_old=args.k3_topk_old, gate_mode=args.k3_gate_mode,
+                        gate_threshold=args.k3_gate_threshold, gate_min=args.k3_gate_min)
 
     if idx > 0:
         args.resume = training_set[idx - 1] + '.pth'
@@ -1322,7 +1362,9 @@ for idx, dataset_name in enumerate(training_set):
 
         old_model = build_vision_transformer(num_classes=old_num_classes[0], cfg=cfg)
         old_model.to(device)
-        configure_k3_router(old_model, args.route_tau, args.train_k3_old_scale, args.eval_k3_old_scale, args.distill_k3_fusion_mode)
+        configure_k3_router(old_model, args.route_tau, args.train_k3_old_scale, args.eval_k3_old_scale, args.distill_k3_fusion_mode,
+                            topk_old=args.k3_topk_old, gate_mode=args.k3_gate_mode,
+                            gate_threshold=args.k3_gate_threshold, gate_min=args.k3_gate_min)
         for task_id in range(idx):
             old_model.add_task(task_id)
         old_model.load_param(model_path)
