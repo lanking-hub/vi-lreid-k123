@@ -36,6 +36,15 @@ cfg.STRIDE_SIZE =  [12, 12]
 cfg.DROP_OUT = 0.03
 cfg.ATT_DROP_RATE = 0.0
 cfg.DROP_PATH = 0.1
+cfg.K1_BLOCKS = '4-7'
+cfg.K2_BLOCKS = '0-3'
+cfg.K3_BLOCKS = '8-11'
+cfg.K1_LORA_RANK = 4
+cfg.K2_LORA_RANK = 4
+cfg.K3_LORA_RANK = 4
+cfg.K1_LORA_ALPHA = 8
+cfg.K2_LORA_ALPHA = 8
+cfg.K3_LORA_ALPHA = 8
 
 # optimizer
 cfg.OPTIMIZER_NAME = 'AdamW'  # AdamW or SGD

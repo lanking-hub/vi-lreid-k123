@@ -336,6 +336,12 @@ class LoRALinearWithBranches(nn.Module):
         use_k3=False,
         rank=4,
         alpha=8,
+        k1_rank=None,
+        k2_rank=None,
+        k3_rank=None,
+        k1_alpha=None,
+        k2_alpha=None,
+        k3_alpha=None,
         dropout=0.0,
         init_scale=1e-3,
     ):
@@ -350,24 +356,30 @@ class LoRALinearWithBranches(nn.Module):
         self.use_k1 = use_k1
         self.use_k2 = use_k2
         self.use_k3 = use_k3
+        k1_rank = rank if k1_rank is None else k1_rank
+        k2_rank = rank if k2_rank is None else k2_rank
+        k3_rank = rank if k3_rank is None else k3_rank
+        k1_alpha = alpha if k1_alpha is None else k1_alpha
+        k2_alpha = alpha if k2_alpha is None else k2_alpha
+        k3_alpha = alpha if k3_alpha is None else k3_alpha
 
         self.shared_adapter = (
-            LoRAAdapter(self.in_features, self.out_features, rank=rank, alpha=alpha, dropout=dropout)
+            LoRAAdapter(self.in_features, self.out_features, rank=k1_rank, alpha=k1_alpha, dropout=dropout)
             if use_k1
             else None
         )
         self.rgb_adapter = (
-            LoRAAdapter(self.in_features, self.out_features, rank=rank, alpha=alpha, dropout=dropout)
+            LoRAAdapter(self.in_features, self.out_features, rank=k2_rank, alpha=k2_alpha, dropout=dropout)
             if use_k2
             else None
         )
         self.ir_adapter = (
-            LoRAAdapter(self.in_features, self.out_features, rank=rank, alpha=alpha, dropout=dropout)
+            LoRAAdapter(self.in_features, self.out_features, rank=k2_rank, alpha=k2_alpha, dropout=dropout)
             if use_k2
             else None
         )
         self.task_bank = (
-            TaskLoRABank(self.in_features, self.out_features, rank=rank, alpha=alpha, dropout=dropout)
+            TaskLoRABank(self.in_features, self.out_features, rank=k3_rank, alpha=k3_alpha, dropout=dropout)
             if use_k3
             else None
         )

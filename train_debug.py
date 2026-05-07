@@ -116,6 +116,18 @@ parser.add_argument('--dist_backend', type=str, default='nccl', help='distribute
 parser.add_argument('--log_branch_stats', action='store_true', help='record K1/K2/K3 branch contribution statistics during training')
 parser.add_argument('--branch_log_interval', type=int, default=1, help='record branch statistics every N epochs')
 parser.add_argument('--branch_log_blocks', type=str, default='0,3,4,7,8,11', help='comma-separated ViT block ids for branch statistics')
+parser.add_argument('--k1_blocks', type=str, default='4-7',
+                    help='comma-separated/range ViT block ids for K1 shared LoRA, e.g. 0-11')
+parser.add_argument('--k2_blocks', type=str, default='0-3',
+                    help='comma-separated/range ViT block ids for K2 modality LoRA, e.g. 0-7')
+parser.add_argument('--k3_blocks', type=str, default='8-11',
+                    help='comma-separated/range ViT block ids for K3 task LoRA, e.g. 8-11')
+parser.add_argument('--k1_rank', type=int, default=4, help='LoRA rank for K1 shared adapters')
+parser.add_argument('--k2_rank', type=int, default=4, help='LoRA rank for K2 modality adapters')
+parser.add_argument('--k3_rank', type=int, default=4, help='LoRA rank for K3 task adapters')
+parser.add_argument('--k1_alpha', type=int, default=8, help='LoRA alpha for K1 shared adapters')
+parser.add_argument('--k2_alpha', type=int, default=8, help='LoRA alpha for K2 modality adapters')
+parser.add_argument('--k3_alpha', type=int, default=8, help='LoRA alpha for K3 task adapters')
 parser.add_argument('--k1_xmod_align_weight', type=float, default=0.0,
                     help='weight for K1 cross-modality identity SupCon alignment')
 parser.add_argument('--k1_xmod_align_temp', type=float, default=0.1,
@@ -183,6 +195,15 @@ cfg.merge_from_list(args.opts)
 cfg.defrost()
 cfg.BATCH_SIZE = args.debug_batch_size
 cfg.MAX_EPOCH = args.debug_max_epoch
+cfg.K1_BLOCKS = args.k1_blocks
+cfg.K2_BLOCKS = args.k2_blocks
+cfg.K3_BLOCKS = args.k3_blocks
+cfg.K1_LORA_RANK = args.k1_rank
+cfg.K2_LORA_RANK = args.k2_rank
+cfg.K3_LORA_RANK = args.k3_rank
+cfg.K1_LORA_ALPHA = args.k1_alpha
+cfg.K2_LORA_ALPHA = args.k2_alpha
+cfg.K3_LORA_ALPHA = args.k3_alpha
 cfg.freeze()
 print("==========\nArgs:{}\n==========".format(args))
 if cfg.BATCH_SIZE % cfg.NUM_POS != 0:
@@ -315,6 +336,15 @@ def append_stage_results(stage_name, stage_idx, metrics, eval_k3_fusion_mode=Non
         'k1_align_modules': args.k1_align_modules,
         'k1_norm_guard_weight': float(args.k1_norm_guard_weight),
         'k1_norm_guard_target': float(args.k1_norm_guard_target),
+        'k1_blocks': args.k1_blocks,
+        'k2_blocks': args.k2_blocks,
+        'k3_blocks': args.k3_blocks,
+        'k1_rank': int(args.k1_rank),
+        'k2_rank': int(args.k2_rank),
+        'k3_rank': int(args.k3_rank),
+        'k1_alpha': int(args.k1_alpha),
+        'k2_alpha': int(args.k2_alpha),
+        'k3_alpha': int(args.k3_alpha),
         'k3_topk_old': int(args.k3_topk_old),
         'k3_gate_mode': args.k3_gate_mode,
         'k3_gate_threshold': float(args.k3_gate_threshold),
@@ -334,11 +364,12 @@ def append_stage_results(stage_name, stage_idx, metrics, eval_k3_fusion_mode=Non
                 'world_size\teval_k3_fusion_mode\tdistill_k3_fusion_mode\t'
                 'k1_xmod_align_source\tk1_xmod_align_weight\tk1_xmod_align_temp\t'
                 'k1_align_blocks\tk1_align_modules\tk1_norm_guard_weight\tk1_norm_guard_target\t'
+                'k1_blocks\tk2_blocks\tk3_blocks\tk1_rank\tk2_rank\tk3_rank\tk1_alpha\tk2_alpha\tk3_alpha\t'
                 'k3_topk_old\tk3_gate_mode\tk3_gate_threshold\tk3_gate_min\n'
             )
         for item in metrics:
             summary_file.write(
-                '{}\t{}\t{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format(
+                '{}\t{}\t{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n'.format(
                     stage_name,
                     int(stage_idx),
                     item['dataset'],
@@ -364,6 +395,15 @@ def append_stage_results(stage_name, stage_idx, metrics, eval_k3_fusion_mode=Non
                     args.k1_align_modules,
                     args.k1_norm_guard_weight,
                     args.k1_norm_guard_target,
+                    args.k1_blocks,
+                    args.k2_blocks,
+                    args.k3_blocks,
+                    args.k1_rank,
+                    args.k2_rank,
+                    args.k3_rank,
+                    args.k1_alpha,
+                    args.k2_alpha,
+                    args.k3_alpha,
                     args.k3_topk_old,
                     args.k3_gate_mode,
                     args.k3_gate_threshold,

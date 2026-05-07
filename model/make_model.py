@@ -45,7 +45,16 @@ class build_vision_transformer(nn.Module):
                         stride_size=cfg.STRIDE_SIZE,
                         drop_path_rate=cfg.DROP_PATH,
                         drop_rate=cfg.DROP_OUT,
-                        attn_drop_rate=cfg.ATT_DROP_RATE)
+                        attn_drop_rate=cfg.ATT_DROP_RATE,
+                        k1_blocks=getattr(cfg, 'K1_BLOCKS', None),
+                        k2_blocks=getattr(cfg, 'K2_BLOCKS', None),
+                        k3_blocks=getattr(cfg, 'K3_BLOCKS', None),
+                        k1_rank=getattr(cfg, 'K1_LORA_RANK', None),
+                        k2_rank=getattr(cfg, 'K2_LORA_RANK', None),
+                        k3_rank=getattr(cfg, 'K3_LORA_RANK', None),
+                        k1_alpha=getattr(cfg, 'K1_LORA_ALPHA', None),
+                        k2_alpha=getattr(cfg, 'K2_LORA_ALPHA', None),
+                        k3_alpha=getattr(cfg, 'K3_LORA_ALPHA', None))
 
         self.base.load_param(cfg.PRETRAIN_PATH)
 

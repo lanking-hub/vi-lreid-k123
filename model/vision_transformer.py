@@ -7,6 +7,36 @@ import collections.abc as container_abcs
 import copy
 from model.lora_layers import LoRALinearWithBranches
 
+
+def parse_block_spec(spec, depth):
+    if spec is None:
+        return None
+    value = str(spec).strip().lower()
+    if value == '':
+        return set()
+    if value == 'all':
+        return set(range(depth))
+
+    block_ids = set()
+    for part in value.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            start_text, end_text = part.split('-', 1)
+            start_id = int(start_text.strip())
+            end_id = int(end_text.strip())
+            if end_id < start_id:
+                raise ValueError("Invalid block range '{}': end < start".format(part))
+            candidate_ids = range(start_id, end_id + 1)
+        else:
+            candidate_ids = [int(part)]
+        for block_id in candidate_ids:
+            if block_id < 0 or block_id >= depth:
+                raise ValueError("Block id {} out of range for depth {}".format(block_id, depth))
+            block_ids.add(block_id)
+    return block_ids
+
 def _ntuple(n):
     def parse(x):
         if isinstance(x, container_abcs.Iterable):
@@ -100,6 +130,12 @@ class Attention(nn.Module):
         use_k3=False,
         lora_rank=4,
         lora_alpha=8,
+        k1_rank=None,
+        k2_rank=None,
+        k3_rank=None,
+        k1_alpha=None,
+        k2_alpha=None,
+        k3_alpha=None,
         lora_dropout=0.0,
     ):
         super().__init__()
@@ -117,6 +153,12 @@ class Attention(nn.Module):
             use_k3=use_k3,
             rank=lora_rank,
             alpha=lora_alpha,
+            k1_rank=k1_rank,
+            k2_rank=k2_rank,
+            k3_rank=k3_rank,
+            k1_alpha=k1_alpha,
+            k2_alpha=k2_alpha,
+            k3_alpha=k3_alpha,
             dropout=lora_dropout,
         )
         self.attn_drop = nn.Dropout(attn_drop)
@@ -127,6 +169,12 @@ class Attention(nn.Module):
             use_k3=use_k3,
             rank=lora_rank,
             alpha=lora_alpha,
+            k1_rank=k1_rank,
+            k2_rank=k2_rank,
+            k3_rank=k3_rank,
+            k1_alpha=k1_alpha,
+            k2_alpha=k2_alpha,
+            k3_alpha=k3_alpha,
             dropout=lora_dropout,
         )
         self.proj_drop = nn.Dropout(proj_drop)
@@ -164,6 +212,12 @@ class Block(nn.Module):
         use_k3=False,
         lora_rank=4,
         lora_alpha=8,
+        k1_rank=None,
+        k2_rank=None,
+        k3_rank=None,
+        k1_alpha=None,
+        k2_alpha=None,
+        k3_alpha=None,
         lora_dropout=0.0,
     ):
         super().__init__()
@@ -180,6 +234,12 @@ class Block(nn.Module):
             use_k3=use_k3,
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
+            k1_rank=k1_rank,
+            k2_rank=k2_rank,
+            k3_rank=k3_rank,
+            k1_alpha=k1_alpha,
+            k2_alpha=k2_alpha,
+            k3_alpha=k3_alpha,
             lora_dropout=lora_dropout,
         )
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
@@ -254,6 +314,15 @@ class ViT(nn.Module):
         norm_layer=nn.LayerNorm,
         lora_rank=4,
         lora_alpha=8,
+        k1_blocks=None,
+        k2_blocks=None,
+        k3_blocks=None,
+        k1_rank=None,
+        k2_rank=None,
+        k3_rank=None,
+        k1_alpha=None,
+        k2_alpha=None,
+        k3_alpha=None,
         lora_dropout=0.0,
     ):
         super(ViT, self).__init__()
@@ -273,6 +342,23 @@ class ViT(nn.Module):
 
         shallow_depth = depth // 3
         middle_depth = (2 * depth) // 3
+        k1_block_set = parse_block_spec(k1_blocks, depth)
+        k2_block_set = parse_block_spec(k2_blocks, depth)
+        k3_block_set = parse_block_spec(k3_blocks, depth)
+        if k1_block_set is None:
+            k1_block_set = set(range(shallow_depth, middle_depth))
+        if k2_block_set is None:
+            k2_block_set = set(range(0, shallow_depth))
+        if k3_block_set is None:
+            k3_block_set = set(range(middle_depth, depth))
+        print('LoRA branch blocks: K1={}, K2={}, K3={}; ranks: K1={}, K2={}, K3={}'.format(
+            sorted(k1_block_set),
+            sorted(k2_block_set),
+            sorted(k3_block_set),
+            lora_rank if k1_rank is None else k1_rank,
+            lora_rank if k2_rank is None else k2_rank,
+            lora_rank if k3_rank is None else k3_rank,
+        ))
         self.blocks = nn.ModuleList([
             Block(
                 dim=embed_dim,
@@ -284,11 +370,17 @@ class ViT(nn.Module):
                 attn_drop=attn_drop_rate,
                 drop_path=dpr[i],
                 norm_layer=norm_layer,
-                use_k1=(shallow_depth <= i < middle_depth),
-                use_k2=(i < shallow_depth),
-                use_k3=(i >= middle_depth),
+                use_k1=(i in k1_block_set),
+                use_k2=(i in k2_block_set),
+                use_k3=(i in k3_block_set),
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
+                k1_rank=k1_rank,
+                k2_rank=k2_rank,
+                k3_rank=k3_rank,
+                k1_alpha=k1_alpha,
+                k2_alpha=k2_alpha,
+                k3_alpha=k3_alpha,
                 lora_dropout=lora_dropout,
             )
             for i in range(depth)

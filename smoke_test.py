@@ -135,6 +135,38 @@ def test_lora_branches():
     print("Layer assignment OK: K2 blocks 0-3, K1 blocks 4-7, K3 blocks 8-11")
 
 
+def test_custom_lora_branch_config():
+    print_header("Test 2b: custom K1/K2/K3 branch config")
+    model = ViT(
+        img_size=[256, 128],
+        stride_size=16,
+        depth=12,
+        embed_dim=768,
+        num_heads=12,
+        k1_blocks="0-11",
+        k2_blocks="0-7",
+        k3_blocks="8-11",
+        k1_rank=8,
+        k2_rank=8,
+        k3_rank=4,
+    )
+
+    for i, blk in enumerate(model.blocks):
+        qkv = blk.attn.qkv
+        assert qkv.use_k1, f"Block {i} should enable global K1"
+        assert qkv.use_k2 == (i < 8), f"Block {i} K2 assignment mismatch"
+        assert qkv.use_k3 == (i >= 8), f"Block {i} K3 assignment mismatch"
+        if qkv.shared_adapter is not None:
+            assert qkv.shared_adapter.rank == 8, f"Block {i} K1 rank mismatch"
+        if qkv.rgb_adapter is not None:
+            assert qkv.rgb_adapter.rank == 8, f"Block {i} K2 rank mismatch"
+            assert qkv.ir_adapter.rank == 8, f"Block {i} K2 IR rank mismatch"
+        if qkv.task_bank is not None:
+            assert qkv.task_bank.rank == 4, f"Block {i} K3 rank mismatch"
+
+    print("Custom branch config OK: K1 0-11 r8, K2 0-7 r8, K3 8-11 r4")
+
+
 def test_add_task(device):
     print_header("Test 3: add_task and task-specific forward")
     model = ViT(img_size=[256, 128], stride_size=16, depth=12, embed_dim=768, num_heads=12)
@@ -343,6 +375,7 @@ def main():
         test_vit_forward(device, args.batch_size)
     if run_all or "branches" in requested:
         test_lora_branches()
+        test_custom_lora_branch_config()
     if run_all or "add_task" in requested:
         test_add_task(device)
     if run_all or "router" in requested:
